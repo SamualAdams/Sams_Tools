@@ -12,22 +12,29 @@ This demand planning system follows the Unix philosophy of building small, focus
 ## Core Tools
 
 
-### 1. `tool__workstation` - Session Management
-**Purpose**: Centralized Spark session orchestration and lifecycle management
+### 1. `tool__workstation` - Universal Session Management
+**Purpose**: Centralized Spark session orchestration with full environment compatibility
 
 **Key Functions**:
-- `get_spark(config_preset)` - Get/create Spark session
-- `is_spark_active()` - Check session status
-- `stop_spark()` / `restart_spark()` - Session lifecycle
-- `spark_health_check()` - Session diagnostics
+- `get_spark(config_preset="auto")` - Get/create Spark session with auto-detection
+- `is_spark_active()` - Environment-aware session status check
+- `spark_health_check()` - Comprehensive session diagnostics
+- `inject_spark_for_databricks()` - Manual Databricks session injection
+
+**Environment Support**:
+- **Auto-detection**: Automatically detects local vs Databricks environments
+- **Databricks compatibility**: Uses existing sessions without interference
+- **Java auto-setup**: Finds and configures Java 17+ for local development
+- **Session safety**: Prevents stopping managed Databricks sessions
 
 **Usage Pattern**:
 ```python
 from tool__workstation import get_spark
-spark = get_spark("local_delta")  # Creates session with Delta Lake
+spark = get_spark("auto")  # Auto-detects environment
+spark = get_spark("local_delta")  # Force local with Delta Lake
 ```
 
-**Design Principle**: Single source of truth for Spark configuration across all workflows.
+**Design Principle**: Universal session management that works seamlessly across all Spark environments.
 
 ### 2. `tool__dag_chainer` - DataFrame Workflow Management
 **Purpose**: Chain and manage DataFrames in workflows with inspection capabilities
@@ -106,12 +113,12 @@ df_indexed = indexer.customer("customer_name")
 
 ## Tool Composition Patterns
 
-### Pattern 1: Linear Pipeline
-Sequential tool application for data processing:
+### Pattern 1: Universal Linear Pipeline
+Sequential tool application that works everywhere:
 
 ```python
-# Initialize
-spark = get_spark("local_delta")
+# Initialize - auto-detects local vs Databricks
+spark = get_spark("auto")
 chain = DagChain()
 
 # Compose: Import → Standardize → Chain → Write
@@ -194,14 +201,14 @@ chain__forecast.dag__combined = combined_df
 
 ## Workflow Examples
 
-### Simple Ingestion Workflow
+### Universal Ingestion Workflow
 ```python
 from tool__workstation import get_spark
 from tool__dag_chainer import DagChain
 from tool__table_polisher import polish
 
-# Initialize
-spark = get_spark("local_delta")
+# Initialize - works everywhere
+spark = get_spark("auto")
 chain__gold_demand = DagChain()
 
 # Import and standardize
