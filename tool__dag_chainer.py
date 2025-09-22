@@ -152,3 +152,22 @@ class DagChain:
     def health_check(self) -> dict:
         """Perform a health check on the Spark session."""
         return self._workstation.health_check()
+
+
+if __name__ == "__main__":
+    from pyspark.sql import functions as F
+
+    chain = DagChain()
+    spark = chain.ensure_session("local_delta")
+
+    demo = spark.createDataFrame([
+        ("Acme", "Widget", 10),
+        ("Acme", "Widget", 5),
+        ("Zenith", "Gadget", 7),
+    ], ["customer", "sku", "units"])
+
+    chain.dag__raw = demo
+    chain.dag__by_customer = chain.dag__raw.groupBy("customer").agg(F.sum("units").alias("total_units"))
+
+    chain.trace(shape=True)
+    chain.look(-1)

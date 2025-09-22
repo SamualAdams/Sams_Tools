@@ -74,3 +74,21 @@ def polish(df: DataFrame) -> DataFrame:
     # Final standardization: ensure lowercase columns and proper ordering
     df = _lowercase_columns(df)
     return _reorder_columns(df)
+
+
+if __name__ == "__main__":
+    from pyspark.sql import Row
+    from tool__workstation import SparkWorkstation
+
+    workstation = SparkWorkstation()
+    spark = workstation.start_session("local_delta")
+
+    demo_df = spark.createDataFrame(
+        [
+            Row(KeyP__Customer="  0001", Product_Code="SKU-001", Sales=15),
+            Row(KeyP__Customer="0002", Product_Code="SKU-002", Sales=21),
+        ]
+    )
+
+    polished = polish(demo_df)
+    polished.show()

@@ -93,3 +93,28 @@ class TableIndexer:
         Returns dict with mapping DataFrame and indexed input DataFrame.
         """
         return self.index(source_entity_col, "material")
+
+
+if __name__ == "__main__":
+    from pyspark.sql import Row
+    from tool__workstation import SparkWorkstation
+
+    workstation = SparkWorkstation()
+    spark = workstation.start_session("local_delta")
+
+    demo_df = spark.createDataFrame(
+        [
+            Row(customer_name="Acme", plant_location="Plant-1", material_code="SKU-001"),
+            Row(customer_name="ACME", plant_location="Plant-1", material_code="SKU-002"),
+            Row(customer_name="Zenith", plant_location="Plant-9", material_code="SKU-003"),
+        ]
+    )
+
+    indexer = TableIndexer(demo_df)
+    demo_customer = indexer.customer("customer_name")
+
+    print("=== Customer Mapping ===")
+    demo_customer["mapping"].show()
+
+    print("=== Indexed Data ===")
+    demo_customer["focal_indexed"].show()
