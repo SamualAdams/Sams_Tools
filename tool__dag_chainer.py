@@ -77,15 +77,15 @@ class DagChain:
         print()
     
     def _databricks_display(self):
-        """Return the Databricks display function when available."""
+        """Return the Databricks-native display callable when available."""
         if self._display_cache is not None:
             return self._display_cache
 
         display_fn = None
         if getattr(self._workstation, "_is_databricks", False):
             try:
-                import builtins
-                candidate = getattr(builtins, "display", None)
+                import __main__  # Databricks injects display into notebook globals
+                candidate = getattr(__main__, "display", None)
                 if callable(candidate):
                     display_fn = candidate
             except Exception:
@@ -93,8 +93,10 @@ class DagChain:
 
             if display_fn is None:
                 try:
-                    from IPython.display import display as ipy_display
-                    display_fn = ipy_display
+                    import builtins
+                    candidate = getattr(builtins, "display", None)
+                    if callable(candidate) and "IPython.display" not in getattr(candidate, "__module__", ""):
+                        display_fn = candidate
                 except Exception:
                     display_fn = None
 
