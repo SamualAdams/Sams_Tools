@@ -60,8 +60,8 @@ class TableIndexer:
                 .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
             ).dropDuplicates([normalized_entity])
 
-            max_index_row = existing_mapping.agg(F.max(index_col)).collect()
-            max_index = max_index_row[0][0] if max_index_row and max_index_row[0][0] is not None else 0
+            max_index_row = existing_mapping.agg(F.max(index_col)).first()
+            max_index = max_index_row[0] if max_index_row and max_index_row[0] is not None else 0
 
             new_entities = input_entities.join(
                 existing_mapping.select(normalized_entity),
@@ -69,7 +69,7 @@ class TableIndexer:
                 how="left_anti"
             )
 
-            if new_entities.rdd.isEmpty():
+            if new_entities.limit(1).count() == 0:
                 mapping = existing_mapping
             else:
                 new_entities_with_index = (
