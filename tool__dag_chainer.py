@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from .tool__workstation import get_spark, is_spark_active, SparkWorkstation
+from tool__workstation import get_spark, is_spark_active, SparkWorkstation
 
 class DagChain:
     """

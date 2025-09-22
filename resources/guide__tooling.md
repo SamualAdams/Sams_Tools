@@ -11,6 +11,7 @@ This demand planning system follows the Unix philosophy of building small, focus
 
 ## Core Tools
 
+
 ### 1. `tool__workstation` - Session Management
 **Purpose**: Centralized Spark session orchestration and lifecycle management
 
@@ -69,6 +70,40 @@ df_standardized = polish(df_raw)
 
 **Design Principle**: Ensures consistent data format across all pipeline stages.
 
+### 4. `tool__table_indexer` - Entity Indexing with Persistence
+**Purpose**: Persistent, consistent indexing for entities with Delta table management
+
+**Key Functions**:
+- `TableIndexer(df_entities, catalog, schema)` - Create indexer instance
+- `.customer(column_name)` - Index customer entities
+- `.plant(column_name)` - Index plant entities
+- `.material(column_name)` - Index material entities
+
+**Key Features**:
+- Persistent index mapping using Delta tables
+- Race condition safe MERGE operations
+- Automatic catalog/schema creation
+- Consecutive index assignment preserving existing mappings
+
+**Usage Pattern**:
+```python
+from tool__table_indexer import TableIndexer
+indexer = TableIndexer(df_clean)
+df_indexed = indexer.customer("customer_name")
+```
+
+**Index Column Naming**:
+- Input: `customer_name` → Output: `Index__customer_name`
+- Input: `FK__plant` → Output: `Index__plant`
+- Input: `material_code` → Output: `Index__material_code`
+
+**Delta Table Structure**:
+- Tables: `{catalog}.{schema}.mapping__active_{entity}s`
+- Default: `test_catalog.supply_chain.mapping__active_customers`
+- Columns: `index` (LONG), `{entity}` (STRING)
+
+**Design Principle**: "Like assigning jersey numbers to players" - consistent, persistent entity identification across all workflows.
+
 ## Tool Composition Patterns
 
 ### Pattern 1: Linear Pipeline
@@ -86,8 +121,8 @@ chain.dag__gold_data = polish(
 chain.write_to_path("gold/output", 0)
 ```
 
-### Pattern 2: Multi-Stage Processing
-Using chain to manage complex transformations:
+### Pattern 2: Multi-Stage Processing with Indexing
+Using chain to manage complex transformations with entity indexing:
 
 ```python
 chain = DagChain()
@@ -98,15 +133,23 @@ chain.dag__raw = spark.read.csv("source.csv")
 # Stage 2: Standardization
 chain.dag__standardized = polish(chain.dag__raw)
 
-# Stage 3: Business logic
-chain.dag__enriched = chain.dag__standardized.withColumn("new_field", F.col("old") * 2)
+# Stage 3: Entity indexing
+indexer = TableIndexer(chain.dag__standardized)
+chain.dag__indexed_customers = indexer.customer("customer_name")
+chain.dag__indexed_materials = indexer.material("material_code")
 
-# Stage 4: Output
-chain.write_to_path("gold/enriched", -1)  # Write latest (-1 index)
+# Stage 4: Business logic with indexed entities
+chain.dag__enriched = (
+    chain.dag__indexed_materials
+    .withColumn("demand_category", F.when(F.col("demand_qty") > 1000, "high").otherwise("normal"))
+)
+
+# Stage 5: Output
+chain.write_to_path("gold/enriched_demand", -1)  # Write latest (-1 index)
 ```
 
-### Pattern 3: Parallel Processing
-Multiple chains for different data streams:
+### Pattern 3: Parallel Processing with Shared Entity Indexing
+Multiple chains for different data streams with consistent entity indexing:
 
 ```python
 # Separate chains for different data sources
@@ -114,12 +157,20 @@ chain__demand = DagChain()
 chain__supply = DagChain()
 chain__forecast = DagChain()
 
-# Process each stream
+# Process each stream with standardization
 chain__demand.dag__clean = polish(spark.read.csv("demand.csv"))
 chain__supply.dag__clean = polish(spark.read.csv("supply.csv"))
 
-# Combine streams
-combined_df = chain__demand.pick(0).union(chain__supply.pick(0))
+# Apply consistent entity indexing across streams
+indexer_demand = TableIndexer(chain__demand.dag__clean)
+indexer_supply = TableIndexer(chain__supply.dag__clean)
+
+# Both use the same persistent mapping tables
+chain__demand.dag__indexed = indexer_demand.customer("customer_name")
+chain__supply.dag__indexed = indexer_supply.customer("customer_name")
+
+# Combine streams with consistent entity indices
+combined_df = chain__demand.pick(-1).union(chain__supply.pick(-1))
 chain__forecast.dag__combined = combined_df
 ```
 
@@ -165,9 +216,9 @@ chain__gold_demand.look()
 chain__gold_demand.write_to_path("resources/gold/demand_data", 0)
 ```
 
-### Complex Transformation Workflow
+### Complex Transformation Workflow with Entity Indexing
 ```python
-# Multi-stage transformation
+# Multi-stage transformation with persistent entity indexing
 chain__processing = DagChain()
 
 # Stage 1: Import multiple sources
@@ -178,12 +229,19 @@ chain__processing.dag__raw_supply = spark.read.csv("supply.csv")
 chain__processing.dag__clean_demand = polish(chain__processing.dag__raw_demand)
 chain__processing.dag__clean_supply = polish(chain__processing.dag__raw_supply)
 
-# Stage 3: Join and enrich
-demand_df = chain__processing.pick(-2)  # clean_demand
-supply_df = chain__processing.pick(-1)  # clean_supply
-chain__processing.dag__joined = demand_df.join(supply_df, "customer_code")
+# Stage 3: Apply entity indexing for consistent joining
+indexer_demand = TableIndexer(chain__processing.dag__clean_demand)
+indexer_supply = TableIndexer(chain__processing.dag__clean_supply)
 
-# Stage 4: Business calculations
+chain__processing.dag__indexed_demand = indexer_demand.customer("customer_code")
+chain__processing.dag__indexed_supply = indexer_supply.customer("customer_code")
+
+# Stage 4: Join on indexed entities (more efficient)
+demand_df = chain__processing.dag__indexed_demand
+supply_df = chain__processing.dag__indexed_supply
+chain__processing.dag__joined = demand_df.join(supply_df, "Index__customer_code")
+
+# Stage 5: Business calculations
 chain__processing.dag__calculated = (
     chain__processing.dag__joined
     .withColumn("variance", F.col("actual") - F.col("forecast"))
@@ -252,6 +310,7 @@ chain__processing.write_to_path("resources/gold/demand_analysis", -1)
 | `workstation` | Session management | `get_spark()` | SparkSession |
 | `dag_chainer` | Workflow orchestration | `DagChain()` | Chain container |
 | `table_polisher` | Data standardization | `polish()` | Standardized DataFrame |
+| `table_indexer` | Entity indexing | `TableIndexer()` | DataFrame with index columns |
 
 | Chain Method | Purpose | Example |
 |--------------|---------|---------|

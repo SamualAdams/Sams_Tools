@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
-    <content url="file://$MODULE_DIR$">
-      <excludeFolder url="file://$MODULE_DIR$/.venv" />
-      <excludeFolder url="file://$MODULE_DIR$/models" />
+    <content url="file://$MODULE_DIR$/../Sams_Databricks_Tooling">
+      <excludeFolder url="file://$MODULE_DIR$/../Sams_Databricks_Tooling/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/../Sams_Databricks_Tooling/models" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.13 (JupyterProject)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.13 virtualenv at ~/PycharmProjects/Sams_Databricks_Tooling/.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>
