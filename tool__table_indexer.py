@@ -12,6 +12,13 @@ from tool__workstation import get_spark, is_spark_active
 
 logger = logging.getLogger(__name__)
 
+def _is_databricks_environment() -> bool:
+    """Detect if running in Databricks environment."""
+    import os
+    return ("DATABRICKS_RUNTIME_VERSION" in os.environ or
+            "DB_CLUSTER_ID" in os.environ or
+            any("databricks" in str(v).lower() for v in os.environ.values()))
+
 class TableIndexer:
     """
     Persistent entity indexer with Delta table management.
@@ -26,21 +33,23 @@ class TableIndexer:
     - Integration with workstation session management
     """
 
-    def __init__(self, df_entities, catalog="test_catalog", schema="supply_chain"):
+    def __init__(self, df_entities, catalog=None, schema=None):
         """
         Initialize with DataFrame containing entities that need indices.
 
         Args:
             df_entities: DataFrame containing entities that need indices
-            catalog: Catalog name for Delta tables
-            schema: Schema name for Delta tables
+            catalog: Catalog name for Delta tables (auto-detected if None)
+            schema: Schema name for Delta tables (auto-detected if None)
         """
         if not is_spark_active():
             raise RuntimeError("No active Spark session. Use workstation to start one.")
 
         self.df_entities = df_entities
-        self.catalog = catalog
-        self.schema = schema
+        self.is_databricks = _is_databricks_environment()
+
+        # Auto-detect appropriate catalog and schema based on environment
+        self.catalog, self.schema = self._detect_catalog_and_schema(catalog, schema)
 
         # Ensure catalog and schema exist at initialization
         self._ensure_catalog_and_schema_exist()
@@ -52,6 +61,38 @@ class TableIndexer:
             raise RuntimeError("No active Spark session. Use workstation to start one.")
         return get_spark()
 
+    def _detect_catalog_and_schema(self, catalog, schema):
+        """Auto-detect appropriate catalog and schema based on environment."""
+        if catalog is not None and schema is not None:
+            return catalog, schema
+
+        if self.is_databricks:
+            # In Databricks, try to use existing catalogs or fall back to default
+            try:
+                spark = self.spark
+                # Try to get current catalog
+                current_catalog = spark.sql("SELECT current_catalog()").collect()[0][0]
+
+                # If using default catalog, try to find or create a suitable schema
+                if current_catalog == "spark_catalog":
+                    schema = schema or "default"
+                    catalog = current_catalog
+                    logger.info(f"Using Databricks default catalog: {catalog}.{schema}")
+                else:
+                    # Using Unity Catalog or custom catalog
+                    schema = schema or "supply_chain"
+                    catalog = catalog or current_catalog
+                    logger.info(f"Using Databricks catalog: {catalog}.{schema}")
+
+                return catalog, schema
+
+            except Exception as e:
+                logger.warning(f"Could not detect Databricks catalog, using defaults: {e}")
+                return "spark_catalog", "default"
+        else:
+            # Local environment - use test catalog
+            return catalog or "test_catalog", schema or "supply_chain"
+
     def _get_mapping_table_name(self, entity_kind):
         """Generate standardized mapping table name for entity kind."""
         return f"{self.catalog}.{self.schema}.mapping__active_{entity_kind}s"
@@ -59,17 +100,43 @@ class TableIndexer:
     def _ensure_catalog_and_schema_exist(self):
         """Ensure catalog and schema exist before any operations."""
         try:
-            # Create catalog if it doesn't exist
-            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS {self.catalog}")
-            logger.info(f"Catalog ensured: {self.catalog}")
+            # In Databricks, handle catalog creation more carefully
+            if self.is_databricks:
+                # For spark_catalog, don't try to create it (it already exists)
+                if self.catalog != "spark_catalog":
+                    try:
+                        self.spark.sql(f"CREATE CATALOG IF NOT EXISTS {self.catalog}")
+                        logger.info(f"Catalog ensured: {self.catalog}")
+                    except Exception as e:
+                        logger.warning(f"Could not create catalog {self.catalog}, using existing: {e}")
 
-            # Create schema if it doesn't exist
-            self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
-            logger.info(f"Schema ensured: {self.catalog}.{self.schema}")
+                # Create schema if it doesn't exist
+                try:
+                    self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
+                    logger.info(f"Schema ensured: {self.catalog}.{self.schema}")
+                except Exception as e:
+                    logger.warning(f"Could not create schema {self.catalog}.{self.schema}: {e}")
+                    # In Databricks, if we can't create custom schema, fall back to default
+                    if self.schema != "default":
+                        logger.info("Falling back to default schema")
+                        self.schema = "default"
+            else:
+                # Local environment - create both catalog and schema
+                self.spark.sql(f"CREATE CATALOG IF NOT EXISTS {self.catalog}")
+                logger.info(f"Catalog ensured: {self.catalog}")
+
+                self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
+                logger.info(f"Schema ensured: {self.catalog}.{self.schema}")
 
         except AnalysisException as e:
-            logger.error(f"Failed to create catalog/schema: {e}")
-            raise RuntimeError(f"Cannot initialize TableIndexer: {e}") from e
+            if self.is_databricks:
+                # In Databricks, if all else fails, use spark_catalog.default
+                logger.warning(f"Falling back to spark_catalog.default due to: {e}")
+                self.catalog = "spark_catalog"
+                self.schema = "default"
+            else:
+                logger.error(f"Failed to create catalog/schema: {e}")
+                raise RuntimeError(f"Cannot initialize TableIndexer: {e}") from e
 
     def _table_exists(self, table_name):
         """
