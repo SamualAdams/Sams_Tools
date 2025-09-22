@@ -7,17 +7,22 @@ class TableIndexer:
     """
     Stateless entity indexer for demand planning entities (customer, plant, material).
     Assigns stable, consecutive indices to unique, normalized entities.
-    No persistence is performed.
+    No persistence is performed; the original DataFrame is preserved as ``base_df``
+    and all newly created index columns accumulate on ``indexed_df``.
     """
     def __init__(self, df_entities):
         """
         Initialize with DataFrame containing entities that need indices.
+
         Args:
-            df_entities: DataFrame containing entities that need indices
+            df_entities: Source DataFrame containing entities to index.
+                Stored as ``base_df`` (never mutated) while ``indexed_df`` keeps
+                the progressively indexed results.
         """
         if not is_spark_active():
             raise RuntimeError("No active Spark session. Use workstation to start one.")
-        self.df_entities = df_entities
+        self.base_df = df_entities
+        self.indexed_df = df_entities
 
     def _create_index_column_name(self, source_entity_col):
         """Create standardized index column name from input column name."""
@@ -30,13 +35,17 @@ class TableIndexer:
         """
         Statelessly assign stable, consecutive indices to unique, normalized entities.
         Args:
-            source_entity_col: Name of the column in df_entities to index (e.g., 'customer', 'plant', etc.)
+            source_entity_col: Name of the column to index (e.g., 'customer', 'plant', etc.).
             entity_kind: Kind of entity ('customer', 'plant', 'material', etc.)
             existing_mapping_df: Optional mapping DataFrame to extend with new entities
         Returns:
             dict with:
               - "mapping": DataFrame of mapping (columns: [index, normalized_entity])
               - "focal_indexed": input DataFrame with an index column joined
+        Note:
+            ``base_df`` remains unchanged; ``indexed_df`` is updated in-place with
+            every call so additional entity kinds compound on the progressively
+            indexed DataFrame.
         """
         normalized_entity = entity_kind
         index_col = "index"
@@ -44,7 +53,7 @@ class TableIndexer:
         normalized_join_col = f"{source_entity_col}__normalized"
         # Normalize and deduplicate entities
         input_entities = (
-            self.df_entities
+            self.indexed_df
             .select(normalized_expr.alias(normalized_entity))
             .distinct()
             .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
@@ -90,7 +99,7 @@ class TableIndexer:
         index_col_name = self._create_index_column_name(source_entity_col)
         # Join index back to original DataFrame
         focal_indexed = (
-            self.df_entities
+            self.indexed_df
             .join(
                 mapping.select(
                     F.col(normalized_entity).alias(normalized_join_col),
@@ -101,6 +110,7 @@ class TableIndexer:
             )
             .drop(normalized_join_col)
         )
+        self.indexed_df = focal_indexed
         return {
             "mapping": mapping.orderBy(index_col),
             "focal_indexed": focal_indexed
@@ -109,21 +119,27 @@ class TableIndexer:
     def customer(self, source_entity_col, existing_mapping_df=None):
         """
         Stateless indexing for customers.
-        Returns dict with mapping DataFrame and indexed input DataFrame.
+
+        Updates ``indexed_df`` in-place with the customer index column while
+        returning the mapping and latest DataFrame snapshot.
         """
         return self.index(source_entity_col, "customer", existing_mapping_df=existing_mapping_df)
 
     def plant(self, source_entity_col, existing_mapping_df=None):
         """
         Stateless indexing for plants.
-        Returns dict with mapping DataFrame and indexed input DataFrame.
+
+        Updates ``indexed_df`` in-place with the plant index column while
+        returning the mapping and latest DataFrame snapshot.
         """
         return self.index(source_entity_col, "plant", existing_mapping_df=existing_mapping_df)
 
     def material(self, source_entity_col, existing_mapping_df=None):
         """
         Stateless indexing for materials.
-        Returns dict with mapping DataFrame and indexed input DataFrame.
+
+        Updates ``indexed_df`` in-place with the material index column while
+        returning the mapping and latest DataFrame snapshot.
         """
         return self.index(source_entity_col, "material", existing_mapping_df=existing_mapping_df)
 
@@ -135,30 +151,28 @@ if __name__ == "__main__":
     workstation = SparkWorkstation()
     spark = workstation.start_session("local_delta")
 
-    print("=== First run: baseline mapping ===")
-    first_batch = spark.createDataFrame(
+    demo_df = spark.createDataFrame(
         [
             Row(customer_name="Acme", plant_location="Plant-1", material_code="SKU-001"),
             Row(customer_name="ACME", plant_location="Plant-1", material_code="SKU-002"),
-            Row(customer_name="Zenith", plant_location="Plant-9", material_code="SKU-003"),
-        ]
-    )
-
-    indexer = TableIndexer(first_batch)
-    first_result = indexer.customer("customer_name")
-    first_result["mapping"].orderBy("index").show()
-    first_result["focal_indexed"].show()
-
-    print("=== Second run: extend mapping with new customer ===")
-    second_batch = spark.createDataFrame(
-        [
-            Row(customer_name="Acme", plant_location="Plant-1", material_code="SKU-001"),
             Row(customer_name="Zenith", plant_location="Plant-9", material_code="SKU-003"),
             Row(customer_name="Nova Retail", plant_location="Plant-42", material_code="SKU-900"),
         ]
     )
 
-    indexer.df_entities = second_batch
-    second_result = indexer.customer("customer_name", existing_mapping_df=first_result["mapping"])
-    second_result["mapping"].orderBy("index").show()
-    second_result["focal_indexed"].show()
+    indexer = TableIndexer(demo_df)
+
+    print("=== Plant Mapping ===")
+    plant_result = indexer.plant("plant_location")
+    plant_result["mapping"].orderBy("index").show()
+
+    print("=== Material Mapping ===")
+    material_result = indexer.material("material_code")
+    material_result["mapping"].orderBy("index").show()
+
+    print("=== Customer Mapping ===")
+    customer_result = indexer.customer("customer_name")
+    customer_result["mapping"].orderBy("index").show()
+
+    print("=== Final Indexed DataFrame ===")
+    indexer.indexed_df.show()
