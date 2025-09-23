@@ -143,8 +143,13 @@ class TableIndexer:
                 .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)).cast("long"))
             )
 
-        # Standardized index column name for joining
-        index_col_name = self._create_index_column_name(primary_col)
+        # Standardized index column name based on all source columns
+        if isinstance(source_entity_cols, str):
+            # Single column scenario
+            index_col_name = f"index__{source_entity_cols}"
+        else:
+            # Composite key scenario - concatenate all column names
+            index_col_name = f"index__{'_'.join(source_entity_cols)}"
 
         # Drop existing index column if present (prevents duplicates on re-run)
         self.indexed_df = self.indexed_df.drop(index_col_name)
@@ -303,7 +308,7 @@ if __name__ == "__main__":
 
     print("Columns after re-run:", len(indexer.indexed_df.columns))
     print("Column names:", indexer.indexed_df.columns)
-    print("✓ No duplicate index__customer_name columns!" if indexer.indexed_df.columns.count("index__customer_name") == 1 else "✗ Duplicate columns detected!")
+    print("✓ No duplicate index__zsource_customer_name columns!" if indexer.indexed_df.columns.count("index__zsource_customer_name") == 1 else "✗ Duplicate columns detected!")
 
     print("\n=== Final DataFrame After Re-indexing ===")
     indexer.indexed_df.show()
@@ -340,4 +345,5 @@ if __name__ == "__main__":
     print("\nAfter TableIndexer (Polish-compatible naming):")
     polish_indexer.indexed_df.show()
     print("Final columns:", polish_indexer.indexed_df.columns)
-    print("✓ Index columns use lowercase 'index__' prefix - consistent with Polish conventions!")
+    print("✓ Index columns use lowercase 'index__' prefix with full column concatenation - consistent with Polish conventions!")
+    print("✓ Column naming pattern: index__zsource_keyp__customer (all source columns represented)")
