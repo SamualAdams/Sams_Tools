@@ -82,17 +82,21 @@ df_standardized = polish(df_raw)
 
 **Key Functions**:
 - `TableIndexer(df_entities)` - Create stateless indexer instance
-- `.customer(source_entity_col, existing_mapping_df=None, append_new_entities=True)` - Index customers
-- `.plant(source_entity_col, existing_mapping_df=None, append_new_entities=True)` - Index plants
-- `.material(source_entity_col, existing_mapping_df=None, append_new_entities=True)` - Index materials
-- `.index(source_entity_col, entity_kind, existing_mapping_df=None, append_new_entities=True)` - Generic indexing
+- `.customer(zsource_col, customer_code_col, existing_mapping_df=None, append_new_entities=True)` - Index customers with composite key
+- `.plant(zsource_col, plant_code_col, existing_mapping_df=None, append_new_entities=True)` - Index plants with composite key
+- `.material(zsource_col, material_code_col, existing_mapping_df=None, append_new_entities=True)` - Index materials with composite key
+- `.index(source_entity_cols, entity_kind, existing_mapping_df=None, append_new_entities=True)` - Generic indexing
 
 **Key Features**:
+- **Four-layer architecture**: `base_df` (original), `indexed_df` (progressive), `filtered_indexed_df` (quality-assured), `focal_indexed` (snapshot)
 - **Stateless operation**: No persistent storage, uses in-memory mappings
+- **Composite key support**: Required zsource + entity_code parameters for proper hierarchy
 - **Leading zero normalization**: Strips leading zeros while preserving single '0'
 - **Polish compatibility**: Lowercase `index__` prefix aligns with Polish conventions
 - **Append control**: `append_new_entities=False` prevents inactive entity indexing
 - **Entity-specific mappings**: `customer_index`, `plant_index`, etc. prevent schema conflicts
+- **Column-concatenation naming**: Index columns show all source columns used (e.g., `index__zsource_customer_code`)
+- **Quality assurance**: `filtered_indexed_df` automatically filters out rows with NULL indices
 - **Idempotent operations**: Running multiple times produces consistent results
 - **Explicit data types**: All indices consistently cast to `long`
 
@@ -105,21 +109,25 @@ from tool__table_polisher import polish
 polished_df = polish(raw_df)  # Standardize first
 indexer = TableIndexer(polished_df)
 
-# Basic indexing
-result = indexer.customer("keyp__customer")
+# Basic indexing with composite key (required)
+result = indexer.customer("zsource", "customer_code")
 mapping_df = result["mapping"]        # [customer, customer_index]
-indexed_df = result["focal_indexed"]  # Original DF + index__keyp__customer
+indexed_df = result["focal_indexed"]  # Original DF + index__zsource_customer_code
 
 # Controlled expansion (dimension tables)
-result = indexer.customer("customer_code",
+result = indexer.customer("zsource", "customer_code",
                          existing_mapping_df=active_customers,
                          append_new_entities=False)  # Only index existing
+
+# Access different views
+complete_data = indexer.indexed_df          # All rows (may contain NULLs)
+clean_data = indexer.filtered_indexed_df    # Only fully-indexed rows (quality-assured)
 ```
 
 **Index Column Naming** (Polish-compatible):
-- Input: `customer_name` → Output: `index__customer_name`
-- Input: `FK__plant` → Output: `index__plant`
-- Input: `keyp__customer` → Output: `index__keyp__customer`
+- Single column: `customer_name` → Output: `index__customer_name`
+- Composite key: `zsource, customer_code` → Output: `index__zsource_customer_code`
+- All source columns concatenated: shows exactly which columns formed the composite key
 
 **Mapping Output Schema**:
 - Customer mappings: `[customer, customer_index]`
@@ -127,7 +135,7 @@ result = indexer.customer("customer_code",
 - Material mappings: `[material, material_index]`
 - Enables conflict-free batch saves to Delta tables
 
-**Design Principle**: Stateless, composable entity indexing that integrates seamlessly with Polish standardization and prevents common pitfalls like schema conflicts and duplicate columns.
+**Design Principle**: Stateless, composable entity indexing that integrates seamlessly with Polish standardization and prevents common pitfalls like schema conflicts and duplicate columns. The four-layer architecture separates concerns: data preservation (`base_df`), progressive indexing (`indexed_df`), quality assurance (`filtered_indexed_df`), and operation snapshots (`focal_indexed`).
 
 ## Tool Composition Patterns
 
@@ -189,17 +197,17 @@ chain__supply.dag__clean = polish(spark.read.csv("supply.csv"))
 
 # Create master entity mappings from primary data source
 master_indexer = TableIndexer(chain__demand.dag__clean)
-customer_mapping = master_indexer.customer("customer_name")["mapping"]
-plant_mapping = master_indexer.plant("plant_location")["mapping"]
+customer_mapping = master_indexer.customer("zsource", "customer_code")["mapping"]
+plant_mapping = master_indexer.plant("zsource", "plant_code")["mapping"]
 
 # Apply consistent indexing to both streams using shared mappings
 demand_indexer = TableIndexer(chain__demand.dag__clean)
-demand_result = demand_indexer.customer("customer_name", existing_mapping_df=customer_mapping)
-chain__demand.dag__indexed = demand_indexer.indexed_df
+demand_result = demand_indexer.customer("zsource", "customer_code", existing_mapping_df=customer_mapping)
+chain__demand.dag__indexed = demand_indexer.filtered_indexed_df  # Quality-assured data only
 
 supply_indexer = TableIndexer(chain__supply.dag__clean)
-supply_result = supply_indexer.customer("customer_name", existing_mapping_df=customer_mapping)
-chain__supply.dag__indexed = supply_indexer.indexed_df
+supply_result = supply_indexer.customer("zsource", "customer_code", existing_mapping_df=customer_mapping)
+chain__supply.dag__indexed = supply_indexer.filtered_indexed_df  # Quality-assured data only
 
 # Save mappings for reuse (conflict-free batch save)
 for kind, mapping in {

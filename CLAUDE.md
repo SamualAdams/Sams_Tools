@@ -53,10 +53,11 @@ The Demand Planning Agent is built on a Unix-like tool composition philosophy wh
 
 #### Entity Indexing
 - **`tool__table_indexer.py`** - Stateless entity indexing for dimensional modeling
-  - Assigns stable, consecutive indices to unique, normalized entities
-  - Supports customer, plant, material, and custom entity types
+  - Assigns stable, consecutive indices to unique, normalized composite keys
+  - Requires zsource + entity_code parameters for proper hierarchy (zsource > entity)
   - Leading zero normalization and case standardization
   - Polish-compatible naming (lowercase `index__` prefix)
+  - Column-concatenation naming shows all source columns (e.g., `index__zsource_customer_code`)
   - Append control for mapping expansion (`append_new_entities` parameter)
   - Entity-specific mapping columns (`customer_index`, `plant_index`, etc.)
   - Idempotent operations prevent duplicate index columns
@@ -205,19 +206,21 @@ from tool__table_polisher import polish
 polished_df = polish(raw_df)  # Standardize first
 indexer = TableIndexer(polished_df)
 
-# Basic entity indexing
-customer_result = indexer.customer("keyp__customer")
-plant_result = indexer.plant("plant_location")
-material_result = indexer.material("material_code")
+# Basic entity indexing with composite keys (required)
+customer_result = indexer.customer("zsource", "customer_code")
+plant_result = indexer.plant("zsource", "plant_code")
+material_result = indexer.material("zsource", "material_code")
 
 # Controlled mapping expansion
-result = indexer.customer("customer_code",
+result = indexer.customer("zsource", "customer_code",
                          existing_mapping_df=active_customers,
                          append_new_entities=False)  # Only index existing
 
 # Access results
 mapping_df = result["mapping"]           # [customer, customer_index]
-indexed_df = result["focal_indexed"]     # Original DF + index__customer_code
+complete_df = indexer.indexed_df         # All rows (may contain NULLs)
+clean_df = indexer.filtered_indexed_df   # Only fully-indexed rows (quality-assured)
+indexed_df = result["focal_indexed"]     # Snapshot of current operation
 
 # Safe batch mapping saves (no schema conflicts)
 for kind, mapping in {

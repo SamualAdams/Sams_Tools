@@ -7,8 +7,14 @@ class TableIndexer:
     """
     Stateless entity indexer for demand planning entities (customer, plant, material).
     Assigns stable, consecutive indices to unique, normalized entities.
-    No persistence is performed; the original DataFrame is preserved as ``base_df``
-    and all newly created index columns accumulate on ``indexed_df``.
+
+    Four-layer architecture:
+    - ``base_df``: Original, immutable DataFrame (never mutated)
+    - ``indexed_df``: Progressive accumulation of index columns (may contain NULLs from failed joins)
+    - ``filtered_indexed_df``: Quality-assured view with only fully-indexed rows (all index columns NOT NULL)
+    - Return ``focal_indexed``: Snapshot of current indexing operation
+
+    No persistence is performed; all operations are stateless and in-memory.
     """
     def __init__(self, df_entities):
         """
@@ -16,13 +22,42 @@ class TableIndexer:
 
         Args:
             df_entities: Source DataFrame containing entities to index.
-                Stored as ``base_df`` (never mutated) while ``indexed_df`` keeps
-                the progressively indexed results.
+                Stored as ``base_df`` (never mutated) while ``indexed_df`` progressively
+                accumulates index columns and ``filtered_indexed_df`` provides quality-assured view.
         """
         if not is_spark_active():
             raise RuntimeError("No active Spark session. Use workstation to start one.")
         self.base_df = df_entities
         self.indexed_df = df_entities
+
+    @property
+    def filtered_indexed_df(self):
+        """
+        Quality-assured view of indexed_df containing only rows where ALL index columns resolved successfully.
+
+        This property dynamically filters indexed_df to include only rows where all index__* columns
+        are NOT NULL, providing a clean dataset for downstream processing that requires complete indexing.
+
+        Returns:
+            DataFrame with only rows that have successfully resolved all entity indices
+        """
+        # Find all index columns
+        index_columns = [col for col in self.indexed_df.columns if col.startswith("index__")]
+
+        if not index_columns:
+            # No index columns yet, return the current indexed_df
+            return self.indexed_df
+
+        # Build filter condition: all index columns must be NOT NULL
+        filter_condition = None
+        for col in index_columns:
+            condition = F.col(col).isNotNull()
+            if filter_condition is None:
+                filter_condition = condition
+            else:
+                filter_condition = filter_condition & condition
+
+        return self.indexed_df.filter(filter_condition)
 
     def _create_index_column_name(self, source_entity_col):
         """Create standardized index column name from input column name (Polish-compatible)."""
@@ -347,3 +382,28 @@ if __name__ == "__main__":
     print("Final columns:", polish_indexer.indexed_df.columns)
     print("✓ Index columns use lowercase 'index__' prefix with full column concatenation - consistent with Polish conventions!")
     print("✓ Column naming pattern: index__zsource_keyp__customer (all source columns represented)")
+
+    print("\n=== Test 9: Filtered DataFrame Property ===")
+    # Create data with some rows that will fail to index
+    mixed_df = spark.createDataFrame([
+        Row(customer_name="Good Customer", zsource="SAP"),
+        Row(customer_name=None, zsource="SAP"),  # This will fail to index (NULL customer)
+        Row(customer_name="Another Good", zsource="Oracle"),
+        Row(customer_name="", zsource="Legacy"),  # This will also fail (empty string)
+    ])
+
+    mixed_indexer = TableIndexer(mixed_df)
+    mixed_customer_result = mixed_indexer.customer("zsource", "customer_name")
+
+    print("Original DataFrame count:", mixed_indexer.base_df.count())
+    print("Indexed DataFrame count:", mixed_indexer.indexed_df.count())
+    print("Filtered DataFrame count:", mixed_indexer.filtered_indexed_df.count())
+
+    print("\nIndexed DataFrame (with NULLs):")
+    mixed_indexer.indexed_df.show()
+
+    print("\nFiltered DataFrame (quality-assured):")
+    mixed_indexer.filtered_indexed_df.show()
+
+    print("✓ filtered_indexed_df provides clean, quality-assured data!")
+    print("✓ No manual NULL filtering required in downstream processing!")
