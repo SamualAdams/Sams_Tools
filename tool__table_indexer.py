@@ -123,6 +123,10 @@ class TableIndexer:
 
         # Standardized index column name for joining
         index_col_name = self._create_index_column_name(source_entity_col)
+
+        # Drop existing index column if present (prevents duplicates on re-run)
+        self.indexed_df = self.indexed_df.drop(index_col_name)
+
         # Join index back to original DataFrame
         focal_indexed = (
             self.indexed_df
@@ -253,4 +257,18 @@ if __name__ == "__main__":
     material_result["mapping"].orderBy("index").show()
 
     print("\n=== Final Indexed Fact DataFrame ===")
+    indexer.indexed_df.show()
+
+    print("\n=== Test 6: Duplicate Prevention - Running Customer Indexing Again ===")
+    print("Columns before re-run:", len(indexer.indexed_df.columns))
+    print("Column names:", indexer.indexed_df.columns)
+
+    # Re-run customer indexing - should not create duplicates
+    customer_result_rerun = indexer.customer("customer_name")
+
+    print("Columns after re-run:", len(indexer.indexed_df.columns))
+    print("Column names:", indexer.indexed_df.columns)
+    print("✓ No duplicate Index__customer_name columns!" if indexer.indexed_df.columns.count("Index__customer_name") == 1 else "✗ Duplicate columns detected!")
+
+    print("\n=== Final DataFrame After Re-indexing ===")
     indexer.indexed_df.show()
