@@ -69,7 +69,7 @@ class TableIndexer:
             indexed DataFrame.
         """
         normalized_entity = entity_kind
-        index_col = "index"
+        index_col = f"{entity_kind}_index"
         normalized_expr = self._normalize_entity_value(F.col(source_entity_col))
         normalized_join_col = f"{source_entity_col}__normalized"
         # Normalize and deduplicate entities
@@ -108,7 +108,7 @@ class TableIndexer:
                         new_entities
                         .withColumn(
                             index_col,
-                            F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)
+                            (F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)).cast("long")
                         )
                     )
                     mapping = existing_mapping.unionByName(new_entities_with_index)
@@ -118,7 +118,7 @@ class TableIndexer:
         else:
             mapping = (
                 input_entities
-                .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)))
+                .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)).cast("long"))
             )
 
         # Standardized index column name for joining
@@ -225,8 +225,9 @@ if __name__ == "__main__":
 
     print("=== Test 1: Basic Customer Indexing (append_new_entities=True) ===")
     customer_result = indexer.customer("customer_name")
-    customer_result["mapping"].orderBy("index").show()
+    customer_result["mapping"].orderBy("customer_index").show()
     print("Fact table customers indexed:", customer_result["mapping"].count())
+    print("✓ Mapping columns:", customer_result["mapping"].columns)
 
     # Test 2: Create existing mapping from fact table customers
     fact_customer_mapping = customer_result["mapping"]
@@ -235,14 +236,14 @@ if __name__ == "__main__":
     print("\n=== Test 2: Index Customer Dimension with append_new_entities=True ===")
     dim_indexer = TableIndexer(customer_dim_df)
     dim_result_append = dim_indexer.customer("customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=True)
-    dim_result_append["mapping"].orderBy("index").show()
+    dim_result_append["mapping"].orderBy("customer_index").show()
     print("Total customers after append:", dim_result_append["mapping"].count(), "(includes inactive customers)")
 
     # Test 4: Index customer dimension with append_new_entities=False
     print("\n=== Test 3: Index Customer Dimension with append_new_entities=False ===")
     dim_indexer2 = TableIndexer(customer_dim_df)
     dim_result_no_append = dim_indexer2.customer("customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=False)
-    dim_result_no_append["mapping"].orderBy("index").show()
+    dim_result_no_append["mapping"].orderBy("customer_index").show()
     print("Total customers without append:", dim_result_no_append["mapping"].count(), "(only customers from fact table)")
 
     print("\n=== Test 4: Final Indexed Customer Dimension (no append) ===")
@@ -251,10 +252,12 @@ if __name__ == "__main__":
 
     print("\n=== Test 5: Plant and Material Indexing ===")
     plant_result = indexer.plant("plant_location")
-    plant_result["mapping"].orderBy("index").show()
+    plant_result["mapping"].orderBy("plant_index").show()
+    print("✓ Plant mapping columns:", plant_result["mapping"].columns)
 
     material_result = indexer.material("material_code")
-    material_result["mapping"].orderBy("index").show()
+    material_result["mapping"].orderBy("material_index").show()
+    print("✓ Material mapping columns:", material_result["mapping"].columns)
 
     print("\n=== Final Indexed Fact DataFrame ===")
     indexer.indexed_df.show()
@@ -272,3 +275,10 @@ if __name__ == "__main__":
 
     print("\n=== Final DataFrame After Re-indexing ===")
     indexer.indexed_df.show()
+
+    print("\n=== Test 7: Schema Conflict Prevention ===")
+    print("Entity-specific index column names prevent schema conflicts:")
+    print(f"Customer mapping schema: {customer_result['mapping'].columns}")
+    print(f"Plant mapping schema: {plant_result['mapping'].columns}")
+    print(f"Material mapping schema: {material_result['mapping'].columns}")
+    print("✓ Each mapping has unique index column name - safe for looped saving!")
