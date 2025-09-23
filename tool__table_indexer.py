@@ -31,13 +31,34 @@ class TableIndexer:
             index_col_name = f"Index__{source_entity_col}"
         return index_col_name
 
-    def index(self, source_entity_col, entity_kind, existing_mapping_df=None):
+    def _normalize_entity_value(self, col):
+        """
+        Normalize entity values with consistent transformations:
+        1. Cast to string
+        2. Trim whitespace
+        3. Convert to uppercase
+        4. Strip leading zeros (preserves single '0')
+
+        Args:
+            col: PySpark column to normalize
+        Returns:
+            PySpark column expression with all normalizations applied
+        """
+        # Start with basic normalization
+        normalized = F.upper(F.trim(col.cast("string")))
+        # Strip leading zeros, but preserve single '0' using positive lookahead
+        normalized = F.regexp_replace(normalized, r"^0+(?=\d)", "")
+        return normalized
+
+    def index(self, source_entity_col, entity_kind, existing_mapping_df=None, append_new_entities=True):
         """
         Statelessly assign stable, consecutive indices to unique, normalized entities.
         Args:
             source_entity_col: Name of the column to index (e.g., 'customer', 'plant', etc.).
             entity_kind: Kind of entity ('customer', 'plant', 'material', etc.)
             existing_mapping_df: Optional mapping DataFrame to extend with new entities
+            append_new_entities: If True (default), append new entities to existing mapping.
+                If False, only index entities that exist in existing_mapping_df.
         Returns:
             dict with:
               - "mapping": DataFrame of mapping (columns: [index, normalized_entity])
@@ -49,7 +70,7 @@ class TableIndexer:
         """
         normalized_entity = entity_kind
         index_col = "index"
-        normalized_expr = F.upper(F.trim(F.col(source_entity_col).cast("string")))
+        normalized_expr = self._normalize_entity_value(F.col(source_entity_col))
         normalized_join_col = f"{source_entity_col}__normalized"
         # Normalize and deduplicate entities
         input_entities = (
@@ -63,32 +84,37 @@ class TableIndexer:
             existing_mapping = (
                 existing_mapping_df
                 .select(
-                    F.upper(F.trim(F.col(normalized_entity).cast("string"))).alias(normalized_entity),
+                    self._normalize_entity_value(F.col(normalized_entity)).alias(normalized_entity),
                     F.col(index_col).cast("long").alias(index_col)
                 )
                 .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
             ).dropDuplicates([normalized_entity])
 
-            max_index_row = existing_mapping.agg(F.max(index_col)).first()
-            max_index = max_index_row[0] if max_index_row and max_index_row[0] is not None else 0
+            if append_new_entities:
+                # Current behavior: append new entities to existing mapping
+                max_index_row = existing_mapping.agg(F.max(index_col)).first()
+                max_index = max_index_row[0] if max_index_row and max_index_row[0] is not None else 0
 
-            new_entities = input_entities.join(
-                existing_mapping.select(normalized_entity),
-                on=normalized_entity,
-                how="left_anti"
-            )
-
-            if new_entities.limit(1).count() == 0:
-                mapping = existing_mapping
-            else:
-                new_entities_with_index = (
-                    new_entities
-                    .withColumn(
-                        index_col,
-                        F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)
-                    )
+                new_entities = input_entities.join(
+                    existing_mapping.select(normalized_entity),
+                    on=normalized_entity,
+                    how="left_anti"
                 )
-                mapping = existing_mapping.unionByName(new_entities_with_index)
+
+                if new_entities.limit(1).count() == 0:
+                    mapping = existing_mapping
+                else:
+                    new_entities_with_index = (
+                        new_entities
+                        .withColumn(
+                            index_col,
+                            F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)
+                        )
+                    )
+                    mapping = existing_mapping.unionByName(new_entities_with_index)
+            else:
+                # New behavior: only index entities that exist in existing mapping
+                mapping = existing_mapping
         else:
             mapping = (
                 input_entities
@@ -116,32 +142,50 @@ class TableIndexer:
             "focal_indexed": focal_indexed
         }
 
-    def customer(self, source_entity_col, existing_mapping_df=None):
+    def customer(self, source_entity_col, existing_mapping_df=None, append_new_entities=True):
         """
         Stateless indexing for customers.
+
+        Args:
+            source_entity_col: Name of the column containing customer identifiers
+            existing_mapping_df: Optional existing customer mapping DataFrame
+            append_new_entities: If True (default), append new customers to existing mapping.
+                If False, only index customers that exist in existing_mapping_df.
 
         Updates ``indexed_df`` in-place with the customer index column while
         returning the mapping and latest DataFrame snapshot.
         """
-        return self.index(source_entity_col, "customer", existing_mapping_df=existing_mapping_df)
+        return self.index(source_entity_col, "customer", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
-    def plant(self, source_entity_col, existing_mapping_df=None):
+    def plant(self, source_entity_col, existing_mapping_df=None, append_new_entities=True):
         """
         Stateless indexing for plants.
+
+        Args:
+            source_entity_col: Name of the column containing plant identifiers
+            existing_mapping_df: Optional existing plant mapping DataFrame
+            append_new_entities: If True (default), append new plants to existing mapping.
+                If False, only index plants that exist in existing_mapping_df.
 
         Updates ``indexed_df`` in-place with the plant index column while
         returning the mapping and latest DataFrame snapshot.
         """
-        return self.index(source_entity_col, "plant", existing_mapping_df=existing_mapping_df)
+        return self.index(source_entity_col, "plant", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
-    def material(self, source_entity_col, existing_mapping_df=None):
+    def material(self, source_entity_col, existing_mapping_df=None, append_new_entities=True):
         """
         Stateless indexing for materials.
+
+        Args:
+            source_entity_col: Name of the column containing material identifiers
+            existing_mapping_df: Optional existing material mapping DataFrame
+            append_new_entities: If True (default), append new materials to existing mapping.
+                If False, only index materials that exist in existing_mapping_df.
 
         Updates ``indexed_df`` in-place with the material index column while
         returning the mapping and latest DataFrame snapshot.
         """
-        return self.index(source_entity_col, "material", existing_mapping_df=existing_mapping_df)
+        return self.index(source_entity_col, "material", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
 
 if __name__ == "__main__":
@@ -153,26 +197,60 @@ if __name__ == "__main__":
 
     demo_df = spark.createDataFrame(
         [
-            Row(customer_name="Acme", plant_location="Plant-1", material_code="SKU-001"),
+            Row(customer_name="Acme", plant_location="Plant-001", material_code="SKU-001"),
             Row(customer_name="ACME", plant_location="Plant-1", material_code="SKU-002"),
-            Row(customer_name="Zenith", plant_location="Plant-9", material_code="SKU-003"),
-            Row(customer_name="Nova Retail", plant_location="Plant-42", material_code="SKU-900"),
+            Row(customer_name="Zenith", plant_location="Plant-009", material_code="SKU-003"),
+            Row(customer_name="Nova Retail", plant_location="Plant-042", material_code="SKU-000900"),
+            Row(customer_name=" acme ", plant_location="Plant-0001", material_code="0"),
         ]
     )
 
+    # Demo data with additional customers not in fact data
+    customer_dim_df = spark.createDataFrame(
+        [
+            Row(customer_code="ACME", status="Active"),
+            Row(customer_code="ZENITH", status="Active"),
+            Row(customer_code="NOVA RETAIL", status="Active"),
+            Row(customer_code="Inactive Corp", status="Inactive"),  # This shouldn't be indexed
+            Row(customer_code="Old Client", status="Inactive"),     # This shouldn't be indexed
+        ]
+    )
+
+    # Test 1: Basic indexing (original behavior)
     indexer = TableIndexer(demo_df)
 
-    print("=== Plant Mapping ===")
+    print("=== Test 1: Basic Customer Indexing (append_new_entities=True) ===")
+    customer_result = indexer.customer("customer_name")
+    customer_result["mapping"].orderBy("index").show()
+    print("Fact table customers indexed:", customer_result["mapping"].count())
+
+    # Test 2: Create existing mapping from fact table customers
+    fact_customer_mapping = customer_result["mapping"]
+
+    # Test 3: Index customer dimension with append_new_entities=True (default)
+    print("\n=== Test 2: Index Customer Dimension with append_new_entities=True ===")
+    dim_indexer = TableIndexer(customer_dim_df)
+    dim_result_append = dim_indexer.customer("customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=True)
+    dim_result_append["mapping"].orderBy("index").show()
+    print("Total customers after append:", dim_result_append["mapping"].count(), "(includes inactive customers)")
+
+    # Test 4: Index customer dimension with append_new_entities=False
+    print("\n=== Test 3: Index Customer Dimension with append_new_entities=False ===")
+    dim_indexer2 = TableIndexer(customer_dim_df)
+    dim_result_no_append = dim_indexer2.customer("customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=False)
+    dim_result_no_append["mapping"].orderBy("index").show()
+    print("Total customers without append:", dim_result_no_append["mapping"].count(), "(only customers from fact table)")
+
+    print("\n=== Test 4: Final Indexed Customer Dimension (no append) ===")
+    dim_indexer2.indexed_df.show()
+    print("Note: Inactive customers get NULL indices because they don't exist in fact table mapping")
+
+    print("\n=== Test 5: Plant and Material Indexing ===")
     plant_result = indexer.plant("plant_location")
     plant_result["mapping"].orderBy("index").show()
 
-    print("=== Material Mapping ===")
     material_result = indexer.material("material_code")
     material_result["mapping"].orderBy("index").show()
 
-    print("=== Customer Mapping ===")
-    customer_result = indexer.customer("customer_name")
-    customer_result["mapping"].orderBy("index").show()
-
-    print("=== Final Indexed DataFrame ===")
+    print("\n=== Final Indexed Fact DataFrame ===")
     indexer.indexed_df.show()
