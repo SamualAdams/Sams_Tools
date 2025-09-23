@@ -144,7 +144,7 @@ class TableIndexer:
             )
 
         # Standardized index column name for joining
-        index_col_name = self._create_index_column_name(source_entity_col)
+        index_col_name = self._create_index_column_name(primary_col)
 
         # Drop existing index column if present (prevents duplicates on re-run)
         self.indexed_df = self.indexed_df.drop(index_col_name)
