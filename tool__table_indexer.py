@@ -50,11 +50,23 @@ class TableIndexer:
         normalized = F.regexp_replace(normalized, r"^0+(?=\d)", "")
         return normalized
 
-    def index(self, source_entity_col, entity_kind, existing_mapping_df=None, append_new_entities=True):
+    def _create_composite_key(self, col_list):
+        """
+        Create normalized composite key from multiple columns.
+
+        Args:
+            col_list: List of column names to concatenate
+        Returns:
+            PySpark column expression with normalized composite key
+        """
+        normalized_cols = [self._normalize_entity_value(F.col(col)) for col in col_list]
+        return F.concat_ws("|", *normalized_cols)
+
+    def index(self, source_entity_cols, entity_kind, existing_mapping_df=None, append_new_entities=True):
         """
         Statelessly assign stable, consecutive indices to unique, normalized entities.
         Args:
-            source_entity_col: Name of the column to index (e.g., 'customer', 'plant', etc.).
+            source_entity_cols: List of column names for composite key or single column name string
             entity_kind: Kind of entity ('customer', 'plant', 'material', etc.)
             existing_mapping_df: Optional mapping DataFrame to extend with new entities
             append_new_entities: If True (default), append new entities to existing mapping.
@@ -70,8 +82,18 @@ class TableIndexer:
         """
         normalized_entity = entity_kind
         index_col = f"{entity_kind}_index"
-        normalized_expr = self._normalize_entity_value(F.col(source_entity_col))
-        normalized_join_col = f"{source_entity_col}__normalized"
+
+        # Handle both single column and composite key scenarios
+        if isinstance(source_entity_cols, str):
+            # Single column (backwards compatibility)
+            primary_col = source_entity_cols
+            normalized_expr = self._normalize_entity_value(F.col(source_entity_cols))
+        else:
+            # Composite key (list of columns)
+            primary_col = source_entity_cols[0]  # Use first column for naming
+            normalized_expr = self._create_composite_key(source_entity_cols)
+
+        normalized_join_col = f"{primary_col}__normalized"
         # Normalize and deduplicate entities
         input_entities = (
             self.indexed_df
@@ -146,50 +168,59 @@ class TableIndexer:
             "focal_indexed": focal_indexed
         }
 
-    def customer(self, source_entity_col, existing_mapping_df=None, append_new_entities=True):
+    def customer(self, customer_code_col, zsource_col, existing_mapping_df=None, append_new_entities=True):
         """
-        Stateless indexing for customers.
+        Stateless indexing for customers with required composite key.
 
         Args:
-            source_entity_col: Name of the column containing customer identifiers
+            customer_code_col: Name of the column containing customer codes
+            zsource_col: Name of the column containing data source identifiers
             existing_mapping_df: Optional existing customer mapping DataFrame
             append_new_entities: If True (default), append new customers to existing mapping.
                 If False, only index customers that exist in existing_mapping_df.
 
         Updates ``indexed_df`` in-place with the customer index column while
         returning the mapping and latest DataFrame snapshot.
-        """
-        return self.index(source_entity_col, "customer", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
-    def plant(self, source_entity_col, existing_mapping_df=None, append_new_entities=True):
+        Note: Customer uniqueness requires both customer_code AND zsource for proper identification.
         """
-        Stateless indexing for plants.
+        return self.index([customer_code_col, zsource_col], "customer", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
+
+    def plant(self, plant_code_col, zsource_col, existing_mapping_df=None, append_new_entities=True):
+        """
+        Stateless indexing for plants with required composite key.
 
         Args:
-            source_entity_col: Name of the column containing plant identifiers
+            plant_code_col: Name of the column containing plant codes
+            zsource_col: Name of the column containing data source identifiers
             existing_mapping_df: Optional existing plant mapping DataFrame
             append_new_entities: If True (default), append new plants to existing mapping.
                 If False, only index plants that exist in existing_mapping_df.
 
         Updates ``indexed_df`` in-place with the plant index column while
         returning the mapping and latest DataFrame snapshot.
-        """
-        return self.index(source_entity_col, "plant", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
-    def material(self, source_entity_col, existing_mapping_df=None, append_new_entities=True):
+        Note: Plant uniqueness requires both plant_code AND zsource for proper identification.
         """
-        Stateless indexing for materials.
+        return self.index([plant_code_col, zsource_col], "plant", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
+
+    def material(self, material_code_col, zsource_col, existing_mapping_df=None, append_new_entities=True):
+        """
+        Stateless indexing for materials with required composite key.
 
         Args:
-            source_entity_col: Name of the column containing material identifiers
+            material_code_col: Name of the column containing material codes
+            zsource_col: Name of the column containing data source identifiers
             existing_mapping_df: Optional existing material mapping DataFrame
             append_new_entities: If True (default), append new materials to existing mapping.
                 If False, only index materials that exist in existing_mapping_df.
 
         Updates ``indexed_df`` in-place with the material index column while
         returning the mapping and latest DataFrame snapshot.
+
+        Note: Material uniqueness requires both material_code AND zsource for proper identification.
         """
-        return self.index(source_entity_col, "material", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
+        return self.index([material_code_col, zsource_col], "material", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
 
 if __name__ == "__main__":
@@ -201,22 +232,22 @@ if __name__ == "__main__":
 
     demo_df = spark.createDataFrame(
         [
-            Row(customer_name="Acme", plant_location="Plant-001", material_code="SKU-001"),
-            Row(customer_name="ACME", plant_location="Plant-1", material_code="SKU-002"),
-            Row(customer_name="Zenith", plant_location="Plant-009", material_code="SKU-003"),
-            Row(customer_name="Nova Retail", plant_location="Plant-042", material_code="SKU-000900"),
-            Row(customer_name=" acme ", plant_location="Plant-0001", material_code="0"),
+            Row(customer_name="Acme", plant_location="Plant-001", material_code="SKU-001", zsource="SAP"),
+            Row(customer_name="ACME", plant_location="Plant-1", material_code="SKU-002", zsource="SAP"),
+            Row(customer_name="Zenith", plant_location="Plant-009", material_code="SKU-003", zsource="Oracle"),
+            Row(customer_name="Nova Retail", plant_location="Plant-042", material_code="SKU-000900", zsource="SAP"),
+            Row(customer_name=" acme ", plant_location="Plant-0001", material_code="0", zsource="Legacy"),
         ]
     )
 
     # Demo data with additional customers not in fact data
     customer_dim_df = spark.createDataFrame(
         [
-            Row(customer_code="ACME", status="Active"),
-            Row(customer_code="ZENITH", status="Active"),
-            Row(customer_code="NOVA RETAIL", status="Active"),
-            Row(customer_code="Inactive Corp", status="Inactive"),  # This shouldn't be indexed
-            Row(customer_code="Old Client", status="Inactive"),     # This shouldn't be indexed
+            Row(customer_code="ACME", zsource="SAP", status="Active"),
+            Row(customer_code="ZENITH", zsource="Oracle", status="Active"),
+            Row(customer_code="NOVA RETAIL", zsource="SAP", status="Active"),
+            Row(customer_code="Inactive Corp", zsource="Legacy", status="Inactive"),  # This shouldn't be indexed
+            Row(customer_code="Old Client", zsource="Legacy", status="Inactive"),     # This shouldn't be indexed
         ]
     )
 
@@ -224,10 +255,11 @@ if __name__ == "__main__":
     indexer = TableIndexer(demo_df)
 
     print("=== Test 1: Basic Customer Indexing (append_new_entities=True) ===")
-    customer_result = indexer.customer("customer_name")
+    customer_result = indexer.customer("customer_name", "zsource")
     customer_result["mapping"].orderBy("customer_index").show()
     print("Fact table customers indexed:", customer_result["mapping"].count())
     print("✓ Mapping columns:", customer_result["mapping"].columns)
+    print("✓ Composite key format: customer_name|zsource")
 
     # Test 2: Create existing mapping from fact table customers
     fact_customer_mapping = customer_result["mapping"]
@@ -235,14 +267,14 @@ if __name__ == "__main__":
     # Test 3: Index customer dimension with append_new_entities=True (default)
     print("\n=== Test 2: Index Customer Dimension with append_new_entities=True ===")
     dim_indexer = TableIndexer(customer_dim_df)
-    dim_result_append = dim_indexer.customer("customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=True)
+    dim_result_append = dim_indexer.customer("customer_code", "zsource", existing_mapping_df=fact_customer_mapping, append_new_entities=True)
     dim_result_append["mapping"].orderBy("customer_index").show()
     print("Total customers after append:", dim_result_append["mapping"].count(), "(includes inactive customers)")
 
     # Test 4: Index customer dimension with append_new_entities=False
     print("\n=== Test 3: Index Customer Dimension with append_new_entities=False ===")
     dim_indexer2 = TableIndexer(customer_dim_df)
-    dim_result_no_append = dim_indexer2.customer("customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=False)
+    dim_result_no_append = dim_indexer2.customer("customer_code", "zsource", existing_mapping_df=fact_customer_mapping, append_new_entities=False)
     dim_result_no_append["mapping"].orderBy("customer_index").show()
     print("Total customers without append:", dim_result_no_append["mapping"].count(), "(only customers from fact table)")
 
@@ -251,11 +283,11 @@ if __name__ == "__main__":
     print("Note: Inactive customers get NULL indices because they don't exist in fact table mapping")
 
     print("\n=== Test 5: Plant and Material Indexing ===")
-    plant_result = indexer.plant("plant_location")
+    plant_result = indexer.plant("plant_location", "zsource")
     plant_result["mapping"].orderBy("plant_index").show()
     print("✓ Plant mapping columns:", plant_result["mapping"].columns)
 
-    material_result = indexer.material("material_code")
+    material_result = indexer.material("material_code", "zsource")
     material_result["mapping"].orderBy("material_index").show()
     print("✓ Material mapping columns:", material_result["mapping"].columns)
 
@@ -267,7 +299,7 @@ if __name__ == "__main__":
     print("Column names:", indexer.indexed_df.columns)
 
     # Re-run customer indexing - should not create duplicates
-    customer_result_rerun = indexer.customer("customer_name")
+    customer_result_rerun = indexer.customer("customer_name", "zsource")
 
     print("Columns after re-run:", len(indexer.indexed_df.columns))
     print("Column names:", indexer.indexed_df.columns)
@@ -298,9 +330,12 @@ if __name__ == "__main__":
     polished_df.show()
     print("Polished columns:", polished_df.columns)
 
+    # Add zsource column for demonstration
+    polished_df = polished_df.withColumn("zsource", F.lit("DEMO"))
+
     # Index the polished data
     polish_indexer = TableIndexer(polished_df)
-    polish_customer_result = polish_indexer.customer("keyp__customer")
+    polish_customer_result = polish_indexer.customer("keyp__customer", "zsource")
 
     print("\nAfter TableIndexer (Polish-compatible naming):")
     polish_indexer.indexed_df.show()
