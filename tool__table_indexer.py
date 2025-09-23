@@ -25,10 +25,10 @@ class TableIndexer:
         self.indexed_df = df_entities
 
     def _create_index_column_name(self, source_entity_col):
-        """Create standardized index column name from input column name."""
-        index_col_name = source_entity_col.replace("FK__", "Index__").replace("PK__", "Index__")
-        if not index_col_name.startswith("Index__"):
-            index_col_name = f"Index__{source_entity_col}"
+        """Create standardized index column name from input column name (Polish-compatible)."""
+        index_col_name = source_entity_col.replace("FK__", "index__").replace("PK__", "index__")
+        if not index_col_name.startswith("index__"):
+            index_col_name = f"index__{source_entity_col}"
         return index_col_name
 
     def _normalize_entity_value(self, col):
@@ -271,7 +271,7 @@ if __name__ == "__main__":
 
     print("Columns after re-run:", len(indexer.indexed_df.columns))
     print("Column names:", indexer.indexed_df.columns)
-    print("✓ No duplicate Index__customer_name columns!" if indexer.indexed_df.columns.count("Index__customer_name") == 1 else "✗ Duplicate columns detected!")
+    print("✓ No duplicate index__customer_name columns!" if indexer.indexed_df.columns.count("index__customer_name") == 1 else "✗ Duplicate columns detected!")
 
     print("\n=== Final DataFrame After Re-indexing ===")
     indexer.indexed_df.show()
@@ -282,3 +282,27 @@ if __name__ == "__main__":
     print(f"Plant mapping schema: {plant_result['mapping'].columns}")
     print(f"Material mapping schema: {material_result['mapping'].columns}")
     print("✓ Each mapping has unique index column name - safe for looped saving!")
+
+    print("\n=== Test 8: Polish Integration Test ===")
+    from tool__table_polisher import polish
+
+    # Create test data that needs polishing
+    raw_df = spark.createDataFrame([
+        Row(KeyP__Customer="  001", Plant_Location="Plant-001", Material_Code="SKU-001"),
+        Row(KeyP__Customer="002", Plant_Location="Plant-1", Material_Code="SKU-002"),
+    ])
+
+    # Polish first (standardize to Polish conventions)
+    polished_df = polish(raw_df)
+    print("After Polish standardization:")
+    polished_df.show()
+    print("Polished columns:", polished_df.columns)
+
+    # Index the polished data
+    polish_indexer = TableIndexer(polished_df)
+    polish_customer_result = polish_indexer.customer("keyp__customer")
+
+    print("\nAfter TableIndexer (Polish-compatible naming):")
+    polish_indexer.indexed_df.show()
+    print("Final columns:", polish_indexer.indexed_df.columns)
+    print("✓ Index columns use lowercase 'index__' prefix - consistent with Polish conventions!")
