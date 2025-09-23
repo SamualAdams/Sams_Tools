@@ -51,6 +51,18 @@ The Demand Planning Agent is built on a Unix-like tool composition philosophy wh
   - Column reordering (key columns, code columns, others - alphabetical)
   - Medallion architecture compliance
 
+#### Entity Indexing
+- **`tool__table_indexer.py`** - Stateless entity indexing for dimensional modeling
+  - Assigns stable, consecutive indices to unique, normalized composite keys
+  - Requires zsource + entity_code parameters for proper hierarchy (zsource > entity)
+  - Leading zero normalization and case standardization
+  - Polish-compatible naming (lowercase `index__` prefix)
+  - Column-concatenation naming shows all source columns (e.g., `index__zsource_customer_code`)
+  - Append control for mapping expansion (`append_new_entities` parameter)
+  - Entity-specific mapping columns (`customer_index`, `plant_index`, etc.)
+  - Idempotent operations prevent duplicate index columns
+  - Schema conflict prevention for batch mapping saves
+
 #### LLM Integration
 - **`tools/tool__local_llm.py`** - Local LLM client for agentic reasoning
   - Ollama integration with automatic availability detection
@@ -183,6 +195,40 @@ chain__gold_demand.trace(shape=True)
 # Inspect specific DataFrame
 chain__gold_demand.look(0)  # First DataFrame
 chain__gold_demand.look(-1) # Latest DataFrame
+```
+
+### Entity Indexing Patterns
+```python
+from tool__table_indexer import TableIndexer
+from tool__table_polisher import polish
+
+# Polish-compatible workflow
+polished_df = polish(raw_df)  # Standardize first
+indexer = TableIndexer(polished_df)
+
+# Basic entity indexing with composite keys (required)
+customer_result = indexer.customer("zsource", "customer_code")
+plant_result = indexer.plant("zsource", "plant_code")
+material_result = indexer.material("zsource", "material_code")
+
+# Controlled mapping expansion
+result = indexer.customer("zsource", "customer_code",
+                         existing_mapping_df=active_customers,
+                         append_new_entities=False)  # Only index existing
+
+# Access results
+mapping_df = result["mapping"]           # [customer, customer_index]
+complete_df = indexer.indexed_df         # All rows (may contain NULLs)
+clean_df = indexer.filtered_indexed_df   # Only fully-indexed rows (quality-assured)
+indexed_df = result["focal_indexed"]     # Snapshot of current operation
+
+# Safe batch mapping saves (no schema conflicts)
+for kind, mapping in {
+    "customer": customer_result["mapping"],
+    "plant": plant_result["mapping"],
+    "material": material_result["mapping"]
+}.items():
+    mapping.write.format("delta").mode("overwrite").saveAsTable(f"catalog.schema.map__{kind}s")
 ```
 
 ## Naming Conventions

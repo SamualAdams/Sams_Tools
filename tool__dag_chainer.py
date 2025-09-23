@@ -13,13 +13,14 @@ class DagChain:
     def __init__(self, dags: dict = {}, ensure_spark: bool = True):
         """
         Initialize DagChain with optional DataFrames.
-        
+
         Args:
             dags: Dictionary of DataFrames to initialize with
             ensure_spark: Whether to ensure Spark session is active
         """
         self._workstation = SparkWorkstation()
-        
+        self._display_cache = None
+
         if ensure_spark and not is_spark_active():
             self._workstation.start_session("local_delta")
         
@@ -75,20 +76,48 @@ class DagChain:
         self._universal_display(dag, rows)
         print()
     
+    def _databricks_display(self):
+        """Return the Databricks-native display callable when available."""
+        if self._display_cache is not None:
+            return self._display_cache
+
+        display_fn = None
+        if getattr(self._workstation, "_is_databricks", False):
+            try:
+                import __main__  # Databricks injects display into notebook globals
+                candidate = getattr(__main__, "display", None)
+                if callable(candidate):
+                    display_fn = candidate
+            except Exception:
+                display_fn = None
+
+            if display_fn is None:
+                try:
+                    import builtins
+                    candidate = getattr(builtins, "display", None)
+                    if callable(candidate) and "IPython.display" not in getattr(candidate, "__module__", ""):
+                        display_fn = candidate
+                except Exception:
+                    display_fn = None
+
+        self._display_cache = display_fn
+        return display_fn
+
     def _universal_display(self, df, rows: int = 20):
-        """Universal display method that works in both Databricks and local environments."""
-        try:
-            # Try Databricks display() first - but check if it's actually available
-            from IPython.display import display as ipython_display
-            # In Databricks, there's usually a global display function that's different
-            if 'display' in globals() and callable(globals()['display']):
-                display(df)
-            else:
-                # Use show() - this will always work
-                df.show(rows, truncate=False)
-        except (NameError, ImportError, AttributeError):
-            # Fall back to show() which always works in Spark
-            df.show(rows, truncate=False)
+        """Render DataFrames using Databricks display when available, otherwise fall back to show."""
+        display_fn = self._databricks_display()
+
+        if display_fn is not None:
+            try:
+                display_df = df if rows is None else df.limit(rows)
+                display_fn(display_df)
+                return
+            except Exception:
+                # Reset cache so future calls can fall back gracefully
+                self._display_cache = None
+
+        # Fallback works for local development and when Databricks display is unavailable
+        df.show(rows, truncate=False)
 
     def pick(self, idx: int = -1):
         """Return a dag by index (0-based, negatives allowed) without display/print."""
@@ -152,3 +181,22 @@ class DagChain:
     def health_check(self) -> dict:
         """Perform a health check on the Spark session."""
         return self._workstation.health_check()
+
+
+if __name__ == "__main__":
+    from pyspark.sql import functions as F
+
+    chain = DagChain()
+    spark = chain.ensure_session("local_delta")
+
+    demo = spark.createDataFrame([
+        ("Acme", "Widget", 10),
+        ("Acme", "Widget", 5),
+        ("Zenith", "Gadget", 7),
+    ], ["customer", "sku", "units"])
+
+    chain.dag__raw = demo
+    chain.dag__by_customer = chain.dag__raw.groupBy("customer").agg(F.sum("units").alias("total_units"))
+
+    chain.trace(shape=True)
+    chain.look(-1)

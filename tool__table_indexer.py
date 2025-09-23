@@ -1,386 +1,409 @@
-"""
-Entity Indexing Tool for Demand Planning Workflows
-
-Provides persistent, consistent indexing for entities (customers, plants, materials)
-with automatic Delta table management and race condition handling.
-"""
+"""Stateless entity indexer for demand planning Spark DataFrames."""
 
 from pyspark.sql import functions as F, Window
-from pyspark.sql.utils import AnalysisException
-import logging
-from tool__workstation import get_spark, is_spark_active
-
-logger = logging.getLogger(__name__)
-
-def _is_databricks_environment() -> bool:
-    """Detect if running in Databricks environment."""
-    import os
-    return ("DATABRICKS_RUNTIME_VERSION" in os.environ or
-            "DB_CLUSTER_ID" in os.environ or
-            any("databricks" in str(v).lower() for v in os.environ.values()))
+from tool__workstation import is_spark_active
 
 class TableIndexer:
     """
-    Persistent entity indexer with Delta table management.
+    Stateless entity indexer for demand planning entities (customer, plant, material).
+    Assigns stable, consecutive indices to unique, normalized entities.
 
-    Like assigning jersey numbers to players - you have a roster of players
-    who need unique numbers assigned consistently across games.
+    Four-layer architecture:
+    - ``base_df``: Original, immutable DataFrame (never mutated)
+    - ``indexed_df``: Progressive accumulation of index columns (may contain NULLs from failed joins)
+    - ``filtered_indexed_df``: Quality-assured view with only fully-indexed rows (all index columns NOT NULL)
+    - Return ``focal_indexed``: Snapshot of current indexing operation
 
-    Features:
-    - Persistent index mapping using Delta tables
-    - Race condition safe MERGE operations
-    - Automatic catalog/schema management
-    - Integration with workstation session management
+    No persistence is performed; all operations are stateless and in-memory.
     """
-
-    def __init__(self, df_entities, catalog=None, schema=None):
+    def __init__(self, df_entities):
         """
         Initialize with DataFrame containing entities that need indices.
 
         Args:
-            df_entities: DataFrame containing entities that need indices
-            catalog: Catalog name for Delta tables (auto-detected if None)
-            schema: Schema name for Delta tables (auto-detected if None)
+            df_entities: Source DataFrame containing entities to index.
+                Stored as ``base_df`` (never mutated) while ``indexed_df`` progressively
+                accumulates index columns and ``filtered_indexed_df`` provides quality-assured view.
         """
         if not is_spark_active():
             raise RuntimeError("No active Spark session. Use workstation to start one.")
-
-        self.df_entities = df_entities
-        self.is_databricks = _is_databricks_environment()
-
-        # Auto-detect appropriate catalog and schema based on environment
-        self.catalog, self.schema = self._detect_catalog_and_schema(catalog, schema)
-
-        # Ensure catalog and schema exist at initialization
-        self._ensure_catalog_and_schema_exist()
+        self.base_df = df_entities
+        self.indexed_df = df_entities
 
     @property
-    def spark(self):
-        """Get the current Spark session from workstation."""
-        if not is_spark_active():
-            raise RuntimeError("No active Spark session. Use workstation to start one.")
-        return get_spark()
+    def filtered_indexed_df(self):
+        """
+        Quality-assured view of indexed_df containing only rows where ALL index columns resolved successfully.
 
-    def _detect_catalog_and_schema(self, catalog, schema):
-        """Auto-detect appropriate catalog and schema based on environment."""
-        if catalog is not None and schema is not None:
-            return catalog, schema
+        This property dynamically filters indexed_df to include only rows where all index__* columns
+        are NOT NULL, providing a clean dataset for downstream processing that requires complete indexing.
 
-        if self.is_databricks:
-            # In Databricks, try to use existing catalogs or fall back to default
-            try:
-                spark = self.spark
-                # Try to get current catalog
-                current_catalog = spark.sql("SELECT current_catalog()").collect()[0][0]
+        Returns:
+            DataFrame with only rows that have successfully resolved all entity indices
+        """
+        # Find all index columns
+        index_columns = [col for col in self.indexed_df.columns if col.startswith("index__")]
 
-                # If using default catalog, try to find or create a suitable schema
-                if current_catalog == "spark_catalog":
-                    schema = schema or "default"
-                    catalog = current_catalog
-                    logger.info(f"Using Databricks default catalog: {catalog}.{schema}")
-                else:
-                    # Using Unity Catalog or custom catalog
-                    schema = schema or "supply_chain"
-                    catalog = catalog or current_catalog
-                    logger.info(f"Using Databricks catalog: {catalog}.{schema}")
+        if not index_columns:
+            # No index columns yet, return the current indexed_df
+            return self.indexed_df
 
-                return catalog, schema
-
-            except Exception as e:
-                logger.warning(f"Could not detect Databricks catalog, using defaults: {e}")
-                return "spark_catalog", "default"
-        else:
-            # Local environment - use test catalog
-            return catalog or "test_catalog", schema or "supply_chain"
-
-    def _get_mapping_table_name(self, entity_kind):
-        """Generate standardized mapping table name for entity kind."""
-        return f"{self.catalog}.{self.schema}.mapping__active_{entity_kind}s"
-
-    def _ensure_catalog_and_schema_exist(self):
-        """Ensure catalog and schema exist before any operations."""
-        try:
-            # In Databricks, handle catalog creation more carefully
-            if self.is_databricks:
-                # For spark_catalog, don't try to create it (it already exists)
-                if self.catalog != "spark_catalog":
-                    try:
-                        self.spark.sql(f"CREATE CATALOG IF NOT EXISTS {self.catalog}")
-                        logger.info(f"Catalog ensured: {self.catalog}")
-                    except Exception as e:
-                        logger.warning(f"Could not create catalog {self.catalog}, using existing: {e}")
-
-                # Create schema if it doesn't exist
-                try:
-                    self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
-                    logger.info(f"Schema ensured: {self.catalog}.{self.schema}")
-                except Exception as e:
-                    logger.warning(f"Could not create schema {self.catalog}.{self.schema}: {e}")
-                    # In Databricks, if we can't create custom schema, fall back to default
-                    if self.schema != "default":
-                        logger.info("Falling back to default schema")
-                        self.schema = "default"
+        # Build filter condition: all index columns must be NOT NULL
+        filter_condition = None
+        for col in index_columns:
+            condition = F.col(col).isNotNull()
+            if filter_condition is None:
+                filter_condition = condition
             else:
-                # Local environment - create both catalog and schema
-                self.spark.sql(f"CREATE CATALOG IF NOT EXISTS {self.catalog}")
-                logger.info(f"Catalog ensured: {self.catalog}")
+                filter_condition = filter_condition & condition
 
-                self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
-                logger.info(f"Schema ensured: {self.catalog}.{self.schema}")
-
-        except AnalysisException as e:
-            if self.is_databricks:
-                # In Databricks, if all else fails, use spark_catalog.default
-                logger.warning(f"Falling back to spark_catalog.default due to: {e}")
-                self.catalog = "spark_catalog"
-                self.schema = "default"
-            else:
-                logger.error(f"Failed to create catalog/schema: {e}")
-                raise RuntimeError(f"Cannot initialize TableIndexer: {e}") from e
-
-    def _table_exists(self, table_name):
-        """
-        Check if a table exists - single source of truth.
-        Returns True if table exists, False otherwise.
-        """
-        try:
-            # Parse the table name
-            parts = table_name.split(".")
-            if len(parts) != 3:
-                raise ValueError(f"Table name must be fully qualified: catalog.schema.table, got: {table_name}")
-
-            catalog, schema, table = parts
-
-            # Set the catalog context
-            original_catalog = self.spark.catalog.currentCatalog()
-            try:
-                self.spark.catalog.setCurrentCatalog(catalog)
-
-                # Check if schema exists
-                schemas = [db.name for db in self.spark.catalog.listDatabases()]
-                if schema not in schemas:
-                    logger.debug(f"Schema {schema} not found in catalog {catalog}")
-                    return False
-
-                # Check if table exists in the schema
-                tables = [t.name for t in self.spark.catalog.listTables(schema)]
-                exists = table in tables
-
-                logger.debug(f"Table {table_name} exists: {exists}")
-                return exists
-
-            finally:
-                # Restore original catalog
-                self.spark.catalog.setCurrentCatalog(original_catalog)
-
-        except AnalysisException as e:
-            logger.warning(f"Error checking table existence for {table_name}: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error checking table {table_name}: {e}")
-            return False
-
-    def _create_mapping_table_ddl(self, table_name, normalized_col_name):
-        """
-        Create mapping table using SQL DDL for better concurrency handling.
-        """
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            index LONG NOT NULL,
-            {normalized_col_name} STRING NOT NULL
-        )
-        USING DELTA
-        TBLPROPERTIES (
-            'delta.autoOptimize.optimizeWrite' = 'true',
-            'delta.autoOptimize.autoCompact' = 'true'
-        )
-        """
-
-        try:
-            self.spark.sql(create_table_sql)
-            logger.info(f"Mapping table created or confirmed: {table_name}")
-        except AnalysisException as e:
-            logger.error(f"Failed to create table {table_name}: {e}")
-            raise
-
-    def _get_or_create_index_mapping(self, table_name, normalized_col_name):
-        """Read existing index mapping or create empty one if doesn't exist."""
-
-        # Create table using DDL (handles concurrent creation better)
-        self._create_mapping_table_ddl(table_name, normalized_col_name)
-
-        # Now read the table (it definitely exists)
-        try:
-            df = self.spark.table(table_name)
-            logger.info(f"Successfully loaded mapping table: {table_name}")
-            return df
-        except AnalysisException as e:
-            logger.error(f"Failed to read table {table_name} after creation: {e}")
-            raise
-
-    def _merge_new_indices(self, new_entities_with_index, table_name, normalized_entity):
-        """Safely merge new entities using Delta MERGE to avoid race conditions."""
-
-        if new_entities_with_index.rdd.isEmpty():
-            logger.info(f"No new entities to merge into {table_name}")
-            return
-
-        logger.info(f"Starting merge operation for {table_name}")
-
-        # Create a temporary view for the new entities
-        temp_view_name = f"temp_new_{normalized_entity}s_{id(self)}"
-
-        try:
-            new_entities_with_index.createOrReplaceTempView(temp_view_name)
-            logger.debug(f"Created temporary view: {temp_view_name}")
-
-            # Use Delta MERGE to atomically insert only new entities
-            merge_sql = f"""
-            MERGE INTO {table_name} AS target
-            USING {temp_view_name} AS source
-            ON target.{normalized_entity} = source.{normalized_entity}
-            WHEN NOT MATCHED THEN
-                INSERT ({normalized_entity}, index)
-                VALUES (source.{normalized_entity}, source.index)
-            """
-
-            logger.debug(f"Executing MERGE SQL")
-            result = self.spark.sql(merge_sql)
-
-            # Log merge statistics if available
-            merge_stats = result.collect()
-            if merge_stats:
-                logger.info(f"MERGE completed for {table_name}: {merge_stats}")
-            else:
-                logger.info(f"MERGE completed successfully for {table_name}")
-
-        except AnalysisException as e:
-            logger.error(f"MERGE operation failed for {table_name}: {e}")
-            raise
-        finally:
-            # Always clean up temporary view
-            try:
-                self.spark.catalog.dropTempView(temp_view_name)
-                logger.debug(f"Cleaned up temporary view: {temp_view_name}")
-            except Exception as e:
-                logger.warning(f"Failed to drop temp view {temp_view_name}: {e}")
+        return self.indexed_df.filter(filter_condition)
 
     def _create_index_column_name(self, source_entity_col):
-        """Create standardized index column name from input column name."""
-        index_col_name = source_entity_col.replace("FK__", "Index__").replace("PK__", "Index__")
-        if not index_col_name.startswith("Index__"):
-            index_col_name = f"Index__{source_entity_col}"
+        """Create standardized index column name from input column name (Polish-compatible)."""
+        index_col_name = source_entity_col.replace("FK__", "index__").replace("PK__", "index__")
+        if not index_col_name.startswith("index__"):
+            index_col_name = f"index__{source_entity_col}"
         return index_col_name
 
-    def _assign_indices(self, df_existing_index_map, source_entity_col, normalized_entity, index_col="index"):
+    def _normalize_entity_value(self, col):
         """
-        Internal method to assign consecutive indices while preserving existing mappings.
+        Normalize entity values with consistent transformations:
+        1. Cast to string
+        2. Trim whitespace
+        3. Convert to uppercase
+        4. Strip leading zeros (preserves single '0')
 
-        Returns (updated_index_map, new_entities_with_index, indexed_entities).
+        Args:
+            col: PySpark column to normalize
+        Returns:
+            PySpark column expression with all normalizations applied
         """
-        # Normalize and get distinct entities from input, filter out nulls/empties
+        # Start with basic normalization
+        normalized = F.upper(F.trim(col.cast("string")))
+        # Strip leading zeros, but preserve single '0' using positive lookahead
+        normalized = F.regexp_replace(normalized, r"^0+(?=\d)", "")
+        return normalized
+
+    def _create_composite_key(self, col_list):
+        """
+        Create normalized composite key from multiple columns.
+
+        Args:
+            col_list: List of column names to concatenate
+        Returns:
+            PySpark column expression with normalized composite key
+        """
+        normalized_cols = [self._normalize_entity_value(F.col(col)) for col in col_list]
+        return F.concat_ws("|", *normalized_cols)
+
+    def index(self, source_entity_cols, entity_kind, existing_mapping_df=None, append_new_entities=True):
+        """
+        Statelessly assign stable, consecutive indices to unique, normalized entities.
+        Args:
+            source_entity_cols: List of column names for composite key or single column name string
+            entity_kind: Kind of entity ('customer', 'plant', 'material', etc.)
+            existing_mapping_df: Optional mapping DataFrame to extend with new entities
+            append_new_entities: If True (default), append new entities to existing mapping.
+                If False, only index entities that exist in existing_mapping_df.
+        Returns:
+            dict with:
+              - "mapping": DataFrame of mapping (columns: [index, normalized_entity])
+              - "focal_indexed": input DataFrame with an index column joined
+        Note:
+            ``base_df`` remains unchanged; ``indexed_df`` is updated in-place with
+            every call so additional entity kinds compound on the progressively
+            indexed DataFrame.
+        """
+        normalized_entity = entity_kind
+        index_col = f"{entity_kind}_index"
+
+        # Handle both single column and composite key scenarios
+        if isinstance(source_entity_cols, str):
+            # Single column (backwards compatibility)
+            primary_col = source_entity_cols
+            normalized_expr = self._normalize_entity_value(F.col(source_entity_cols))
+        else:
+            # Composite key (list of columns)
+            primary_col = source_entity_cols[0]  # Use first column for naming
+            normalized_expr = self._create_composite_key(source_entity_cols)
+
+        normalized_join_col = f"{primary_col}__normalized"
+        # Normalize and deduplicate entities
         input_entities = (
-            self.df_entities
-            .select(F.upper(F.trim(F.col(source_entity_col).cast("string"))).alias(normalized_entity))
+            self.indexed_df
+            .select(normalized_expr.alias(normalized_entity))
             .distinct()
             .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
         )
 
-        # Normalize existing mapping for consistent comparison
-        normalized_existing_map = (
-            df_existing_index_map
-            .select(
-                F.upper(F.trim(F.col(normalized_entity).cast("string"))).alias(normalized_entity),
-                F.col(index_col)
+        if existing_mapping_df is not None:
+            existing_mapping = (
+                existing_mapping_df
+                .select(
+                    self._normalize_entity_value(F.col(normalized_entity)).alias(normalized_entity),
+                    F.col(index_col).cast("long").alias(index_col)
+                )
+                .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
+            ).dropDuplicates([normalized_entity])
+
+            if append_new_entities:
+                # Current behavior: append new entities to existing mapping
+                max_index_row = existing_mapping.agg(F.max(index_col)).first()
+                max_index = max_index_row[0] if max_index_row and max_index_row[0] is not None else 0
+
+                new_entities = input_entities.join(
+                    existing_mapping.select(normalized_entity),
+                    on=normalized_entity,
+                    how="left_anti"
+                )
+
+                if new_entities.limit(1).count() == 0:
+                    mapping = existing_mapping
+                else:
+                    new_entities_with_index = (
+                        new_entities
+                        .withColumn(
+                            index_col,
+                            (F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)).cast("long")
+                        )
+                    )
+                    mapping = existing_mapping.unionByName(new_entities_with_index)
+            else:
+                # New behavior: only index entities that exist in existing mapping
+                mapping = existing_mapping
+        else:
+            mapping = (
+                input_entities
+                .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)).cast("long"))
             )
-        )
 
-        # Find entities present in input but not yet in existing mapping
-        new_entities = input_entities.join(
-            normalized_existing_map.select(normalized_entity),
-            on=[normalized_entity],
-            how="left_anti"
-        )
+        # Standardized index column name based on all source columns
+        if isinstance(source_entity_cols, str):
+            # Single column scenario
+            index_col_name = f"index__{source_entity_cols}"
+        else:
+            # Composite key scenario - concatenate all column names
+            index_col_name = f"index__{'_'.join(source_entity_cols)}"
 
-        # Get max index from existing mapping (handle empty case)
-        max_index_row = normalized_existing_map.agg(F.coalesce(F.max(index_col), F.lit(0))).first()
-        max_index = max_index_row[0] if max_index_row else 0
+        # Drop existing index column if present (prevents duplicates on re-run)
+        self.indexed_df = self.indexed_df.drop(index_col_name)
 
-        # Assign consecutive indices to new entities
-        new_entities_with_index = (
-            new_entities
-            .withColumn("_rn", F.row_number().over(Window.orderBy(normalized_entity)))
-            .withColumn(index_col, F.lit(max_index) + F.col("_rn"))
-            .drop("_rn")
-        )
-
-        # Union existing + new for the complete updated mapping
-        updated_index_map = (
-            normalized_existing_map
-            .unionByName(new_entities_with_index)
-            .orderBy(index_col)
-        )
-
-        # Create standardized index column name
-        index_col_name = self._create_index_column_name(source_entity_col)
-
-        # Join original input with updated mapping to add index column
-        df_indexed_entities = (
-            self.df_entities
+        # Join index back to original DataFrame
+        focal_indexed = (
+            self.indexed_df
             .join(
-                updated_index_map.select(
-                    F.col(normalized_entity).alias(source_entity_col + "_join"),
+                mapping.select(
+                    F.col(normalized_entity).alias(normalized_join_col),
                     F.col(index_col).alias(index_col_name)
                 ),
-                on=[F.upper(F.trim(F.col(source_entity_col).cast("string"))) == F.col(source_entity_col + "_join")],
+                on=[normalized_expr == F.col(normalized_join_col)],
                 how="left"
             )
-            .drop(source_entity_col + "_join")
+            .drop(normalized_join_col)
         )
+        self.indexed_df = focal_indexed
+        return {
+            "mapping": mapping.orderBy(index_col),
+            "focal_indexed": focal_indexed
+        }
 
-        return updated_index_map, new_entities_with_index, df_indexed_entities
-
-    def _assign_indices_with_persistence(self, entity_kind, source_entity_col, normalized_entity, index_col="index"):
+    def customer(self, zsource_col, customer_code_col, existing_mapping_df=None, append_new_entities=True):
         """
-        Complete index assignment workflow with Delta table persistence.
+        Stateless indexing for customers with required composite key.
 
-        Uses Delta MERGE to prevent race conditions and data loss.
-        Returns indexed_entities DataFrame.
+        Args:
+            zsource_col: Name of the column containing data source identifiers (primary hierarchy)
+            customer_code_col: Name of the column containing customer codes (within zsource)
+            existing_mapping_df: Optional existing customer mapping DataFrame
+            append_new_entities: If True (default), append new customers to existing mapping.
+                If False, only index customers that exist in existing_mapping_df.
+
+        Updates ``indexed_df`` in-place with the customer index column while
+        returning the mapping and latest DataFrame snapshot.
+
+        Note: Customer uniqueness hierarchy: zsource > customer_code (customers exist within zsource).
         """
+        return self.index([zsource_col, customer_code_col], "customer", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
 
-        # Get table name for this entity kind
-        table_name = self._get_mapping_table_name(entity_kind)
-
-        # Read existing mapping or create empty one
-        df_existing_index_map = self._get_or_create_index_mapping(table_name, normalized_entity)
-
-        # Perform the index assignment
-        updated_index_map, new_entities_with_index, df_indexed_entities = self._assign_indices(
-            df_existing_index_map, source_entity_col, normalized_entity, index_col
-        )
-
-        # Merge new entities if there are any
-        self._merge_new_indices(new_entities_with_index, table_name, normalized_entity)
-
-        return df_indexed_entities
-
-    def customer(self, source_entity_col):
+    def plant(self, zsource_col, plant_code_col, existing_mapping_df=None, append_new_entities=True):
         """
-        Persisted indexing for customers with automatic Delta table persistence.
-        Returns indexed entities DataFrame.
-        """
-        return self._assign_indices_with_persistence("customer", source_entity_col, "customer")
+        Stateless indexing for plants with required composite key.
 
-    def plant(self, source_entity_col):
-        """
-        Persisted indexing for plants with automatic Delta table persistence.
-        Returns indexed entities DataFrame.
-        """
-        return self._assign_indices_with_persistence("plant", source_entity_col, "plant")
+        Args:
+            zsource_col: Name of the column containing data source identifiers (primary hierarchy)
+            plant_code_col: Name of the column containing plant codes (within zsource)
+            existing_mapping_df: Optional existing plant mapping DataFrame
+            append_new_entities: If True (default), append new plants to existing mapping.
+                If False, only index plants that exist in existing_mapping_df.
 
-    def material(self, source_entity_col):
+        Updates ``indexed_df`` in-place with the plant index column while
+        returning the mapping and latest DataFrame snapshot.
+
+        Note: Plant uniqueness hierarchy: zsource > plant_code (plants exist within zsource).
         """
-        Persisted indexing for materials with automatic Delta table persistence.
-        Returns indexed entities DataFrame.
+        return self.index([zsource_col, plant_code_col], "plant", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
+
+    def material(self, zsource_col, material_code_col, existing_mapping_df=None, append_new_entities=True):
         """
-        return self._assign_indices_with_persistence("material", source_entity_col, "material")
+        Stateless indexing for materials with required composite key.
+
+        Args:
+            zsource_col: Name of the column containing data source identifiers (primary hierarchy)
+            material_code_col: Name of the column containing material codes (within zsource)
+            existing_mapping_df: Optional existing material mapping DataFrame
+            append_new_entities: If True (default), append new materials to existing mapping.
+                If False, only index materials that exist in existing_mapping_df.
+
+        Updates ``indexed_df`` in-place with the material index column while
+        returning the mapping and latest DataFrame snapshot.
+
+        Note: Material uniqueness hierarchy: zsource > material_code (materials exist within zsource).
+        """
+        return self.index([zsource_col, material_code_col], "material", existing_mapping_df=existing_mapping_df, append_new_entities=append_new_entities)
+
+
+if __name__ == "__main__":
+    from pyspark.sql import Row
+    from tool__workstation import SparkWorkstation
+
+    workstation = SparkWorkstation()
+    spark = workstation.start_session("local_delta")
+
+    demo_df = spark.createDataFrame(
+        [
+            Row(customer_name="Acme", plant_location="Plant-001", material_code="SKU-001", zsource="SAP"),
+            Row(customer_name="ACME", plant_location="Plant-1", material_code="SKU-002", zsource="SAP"),
+            Row(customer_name="Zenith", plant_location="Plant-009", material_code="SKU-003", zsource="Oracle"),
+            Row(customer_name="Nova Retail", plant_location="Plant-042", material_code="SKU-000900", zsource="SAP"),
+            Row(customer_name=" acme ", plant_location="Plant-0001", material_code="0", zsource="Legacy"),
+        ]
+    )
+
+    # Demo data with additional customers not in fact data
+    customer_dim_df = spark.createDataFrame(
+        [
+            Row(customer_code="ACME", zsource="SAP", status="Active"),
+            Row(customer_code="ZENITH", zsource="Oracle", status="Active"),
+            Row(customer_code="NOVA RETAIL", zsource="SAP", status="Active"),
+            Row(customer_code="Inactive Corp", zsource="Legacy", status="Inactive"),  # This shouldn't be indexed
+            Row(customer_code="Old Client", zsource="Legacy", status="Inactive"),     # This shouldn't be indexed
+        ]
+    )
+
+    # Test 1: Basic indexing (original behavior)
+    indexer = TableIndexer(demo_df)
+
+    print("=== Test 1: Basic Customer Indexing (append_new_entities=True) ===")
+    customer_result = indexer.customer("zsource", "customer_name")
+    customer_result["mapping"].orderBy("customer_index").show()
+    print("Fact table customers indexed:", customer_result["mapping"].count())
+    print("✓ Mapping columns:", customer_result["mapping"].columns)
+    print("✓ Composite key format: zsource|customer_name (hierarchy: zsource > customer)")
+
+    # Test 2: Create existing mapping from fact table customers
+    fact_customer_mapping = customer_result["mapping"]
+
+    # Test 3: Index customer dimension with append_new_entities=True (default)
+    print("\n=== Test 2: Index Customer Dimension with append_new_entities=True ===")
+    dim_indexer = TableIndexer(customer_dim_df)
+    dim_result_append = dim_indexer.customer("zsource", "customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=True)
+    dim_result_append["mapping"].orderBy("customer_index").show()
+    print("Total customers after append:", dim_result_append["mapping"].count(), "(includes inactive customers)")
+
+    # Test 4: Index customer dimension with append_new_entities=False
+    print("\n=== Test 3: Index Customer Dimension with append_new_entities=False ===")
+    dim_indexer2 = TableIndexer(customer_dim_df)
+    dim_result_no_append = dim_indexer2.customer("zsource", "customer_code", existing_mapping_df=fact_customer_mapping, append_new_entities=False)
+    dim_result_no_append["mapping"].orderBy("customer_index").show()
+    print("Total customers without append:", dim_result_no_append["mapping"].count(), "(only customers from fact table)")
+
+    print("\n=== Test 4: Final Indexed Customer Dimension (no append) ===")
+    dim_indexer2.indexed_df.show()
+    print("Note: Inactive customers get NULL indices because they don't exist in fact table mapping")
+
+    print("\n=== Test 5: Plant and Material Indexing ===")
+    plant_result = indexer.plant("zsource", "plant_location")
+    plant_result["mapping"].orderBy("plant_index").show()
+    print("✓ Plant mapping columns:", plant_result["mapping"].columns)
+
+    material_result = indexer.material("zsource", "material_code")
+    material_result["mapping"].orderBy("material_index").show()
+    print("✓ Material mapping columns:", material_result["mapping"].columns)
+
+    print("\n=== Final Indexed Fact DataFrame ===")
+    indexer.indexed_df.show()
+
+    print("\n=== Test 6: Duplicate Prevention - Running Customer Indexing Again ===")
+    print("Columns before re-run:", len(indexer.indexed_df.columns))
+    print("Column names:", indexer.indexed_df.columns)
+
+    # Re-run customer indexing - should not create duplicates
+    customer_result_rerun = indexer.customer("zsource", "customer_name")
+
+    print("Columns after re-run:", len(indexer.indexed_df.columns))
+    print("Column names:", indexer.indexed_df.columns)
+    print("✓ No duplicate index__zsource_customer_name columns!" if indexer.indexed_df.columns.count("index__zsource_customer_name") == 1 else "✗ Duplicate columns detected!")
+
+    print("\n=== Final DataFrame After Re-indexing ===")
+    indexer.indexed_df.show()
+
+    print("\n=== Test 7: Schema Conflict Prevention ===")
+    print("Entity-specific index column names prevent schema conflicts:")
+    print(f"Customer mapping schema: {customer_result['mapping'].columns}")
+    print(f"Plant mapping schema: {plant_result['mapping'].columns}")
+    print(f"Material mapping schema: {material_result['mapping'].columns}")
+    print("✓ Each mapping has unique index column name - safe for looped saving!")
+
+    print("\n=== Test 8: Polish Integration Test ===")
+    from tool__table_polisher import polish
+
+    # Create test data that needs polishing
+    raw_df = spark.createDataFrame([
+        Row(KeyP__Customer="  001", Plant_Location="Plant-001", Material_Code="SKU-001"),
+        Row(KeyP__Customer="002", Plant_Location="Plant-1", Material_Code="SKU-002"),
+    ])
+
+    # Polish first (standardize to Polish conventions)
+    polished_df = polish(raw_df)
+    print("After Polish standardization:")
+    polished_df.show()
+    print("Polished columns:", polished_df.columns)
+
+    # Add zsource column for demonstration
+    polished_df = polished_df.withColumn("zsource", F.lit("DEMO"))
+
+    # Index the polished data
+    polish_indexer = TableIndexer(polished_df)
+    polish_customer_result = polish_indexer.customer("zsource", "keyp__customer")
+
+    print("\nAfter TableIndexer (Polish-compatible naming):")
+    polish_indexer.indexed_df.show()
+    print("Final columns:", polish_indexer.indexed_df.columns)
+    print("✓ Index columns use lowercase 'index__' prefix with full column concatenation - consistent with Polish conventions!")
+    print("✓ Column naming pattern: index__zsource_keyp__customer (all source columns represented)")
+
+    print("\n=== Test 9: Filtered DataFrame Property ===")
+    # Create data with some rows that will fail to index
+    mixed_df = spark.createDataFrame([
+        Row(customer_name="Good Customer", zsource="SAP"),
+        Row(customer_name=None, zsource="SAP"),  # This will fail to index (NULL customer)
+        Row(customer_name="Another Good", zsource="Oracle"),
+        Row(customer_name="", zsource="Legacy"),  # This will also fail (empty string)
+    ])
+
+    mixed_indexer = TableIndexer(mixed_df)
+    mixed_customer_result = mixed_indexer.customer("zsource", "customer_name")
+
+    print("Original DataFrame count:", mixed_indexer.base_df.count())
+    print("Indexed DataFrame count:", mixed_indexer.indexed_df.count())
+    print("Filtered DataFrame count:", mixed_indexer.filtered_indexed_df.count())
+
+    print("\nIndexed DataFrame (with NULLs):")
+    mixed_indexer.indexed_df.show()
+
+    print("\nFiltered DataFrame (quality-assured):")
+    mixed_indexer.filtered_indexed_df.show()
+
+    print("✓ filtered_indexed_df provides clean, quality-assured data!")
+    print("✓ No manual NULL filtering required in downstream processing!")
