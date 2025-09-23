@@ -1,95 +1,87 @@
-# Solution for Issue #1: Metastore Storage Root URL Error
+# OBSOLETE: Legacy Issue Documentation
 
-## 🎯 Problem Resolved
-The "Metastore storage root URL does not exist" error when using TableIndexer in Databricks has been **completely fixed** in the latest update.
+## 🎯 Issue No Longer Applicable
+This issue related to the old persistent TableIndexer implementation with Delta table storage. **The current TableIndexer is completely stateless and this error can no longer occur.**
 
-## ✅ Solution Implemented
+## ✅ Current TableIndexer (v2.0+)
 
-### **Automatic Environment Detection**
-The TableIndexer now automatically detects Databricks environments and adapts accordingly:
-
-```python
-# OLD (caused the error)
-indexer = TableIndexer(df, catalog="test_catalog", schema="supply_chain")
-
-# NEW (works everywhere!)
-indexer = TableIndexer(df)  # Auto-detects environment and uses appropriate catalog
-```
-
-### **Smart Catalog Selection**
-- **Databricks**: Uses `current_catalog()` or falls back to `spark_catalog.default`
-- **Unity Catalog**: Automatically detects and uses Unity Catalog setup
-- **Local Development**: Uses `test_catalog.supply_chain` (auto-created)
-
-### **Graceful Fallbacks**
-If catalog creation fails, the system gracefully falls back:
-1. Tries current catalog with custom schema
-2. Falls back to `spark_catalog` with custom schema
-3. Ultimate fallback: `spark_catalog.default`
-
-## 🔧 How to Update
-
-### **1. Get Latest Code**
-```bash
-git pull origin main
-```
-
-### **2. Update Your Code**
-```python
-# Replace your existing TableIndexer usage:
-indexer = TableIndexer(chain.dag__polished_data)  # Remove catalog/schema params
-chain.dag__indexed_customers = indexer.customer("customer_name")
-chain.dag__indexed_plants = indexer.plant("plant_location")
-chain.dag__indexed_materials = indexer.material("material_code")
-```
-
-### **3. Run the Updated Sample Notebook**
-The `sample.ipynb` now works perfectly in Databricks with all import issues resolved.
-
-## 🏗️ What Changed Technically
-
-1. **Environment Detection**: Added `_is_databricks_environment()` function
-2. **Smart Defaults**: `_detect_catalog_and_schema()` method chooses appropriate defaults
-3. **Robust Creation**: Enhanced `_ensure_catalog_and_schema_exist()` with fallback logic
-4. **Better Logging**: Clear information about which catalog/schema is being used
-5. **Sequential Mapping Support**: `TableIndexer.index()` now accepts an optional `existing_mapping_df` so you can extend active-directory mappings without rewriting prior assignments.
+### **Stateless Design**
+The TableIndexer now operates entirely in-memory with no persistent storage:
 
 ```python
-# First run creates mapping
-first = indexer.customer("customer_name")
-existing = first["mapping"]
+# CURRENT: Stateless, no catalog/schema parameters
+from tool__table_indexer import TableIndexer
 
-# Later run with new data just extends the mapping
-second = indexer.customer("customer_name", existing_mapping_df=existing)
+indexer = TableIndexer(df)  # Simple constructor, no persistence
+result = indexer.customer("customer_name")
+mapping_df = result["mapping"]         # In-memory mapping
+indexed_df = result["focal_indexed"]   # DataFrame with index columns
 ```
 
-## 🚀 Expected Behavior Now
+### **No More Storage Issues**
+- **No Delta tables**: All operations are in-memory
+- **No catalog management**: No persistent storage means no metastore dependencies
+- **No Unity Catalog concerns**: Works identically everywhere
+- **Polish-compatible**: Lowercase naming aligns with standardization tools
 
+## 🔧 Current Usage (v2.0+)
+
+### **Stateless Entity Indexing**
 ```python
-# In Databricks - this will now work:
-indexer = TableIndexer(df)
-print(f"Using: {indexer.catalog}.{indexer.schema}")
-# Output: "Using: spark_catalog.default" or your Unity Catalog
+from tool__table_indexer import TableIndexer
+from tool__table_polisher import polish
+
+# Polish-compatible workflow
+polished_df = polish(raw_df)
+indexer = TableIndexer(polished_df)
+
+# Basic indexing (returns dict with mapping and indexed DataFrame)
+customer_result = indexer.customer("keyp__customer")
+plant_result = indexer.plant("plant_location")
+material_result = indexer.material("material_code")
+
+# Access results
+customer_mapping = customer_result["mapping"]      # [customer, customer_index]
+final_df = indexer.indexed_df                      # Original DF + all index__ columns
 ```
 
-## 📊 Testing
+### **Advanced Features**
+```python
+# Controlled mapping expansion
+result = indexer.customer("customer_code",
+                         existing_mapping_df=active_customers,
+                         append_new_entities=False)  # Only index existing
 
-The fix has been tested with:
-- ✅ Default Databricks workspaces
-- ✅ Unity Catalog enabled workspaces
-- ✅ Local development environments
-- ✅ Various cluster configurations
-- ✅ Sequential runs that reuse prior mapping DataFrames
+# Conflict-free batch saves
+for kind, mapping in {
+    "customer": customer_result["mapping"],
+    "plant": plant_result["mapping"]
+}.items():
+    mapping.write.format("delta").mode("overwrite").saveAsTable(f"catalog.schema.map__{kind}s")
+```
 
-## 🆘 If You Still Have Issues
+## 🏗️ Key Improvements (v2.0+)
 
-1. **Update to latest**: `git pull origin main`
-2. **Check cluster**: Ensure your Databricks cluster is running
-3. **Upload files**: Make sure all tool files are in your workspace
-4. **Enable debug logging**:
-   ```python
-   import logging
-   logging.getLogger("tool__table_indexer").setLevel(logging.DEBUG)
-   ```
+1. **Stateless Operation**: No persistent storage, all in-memory
+2. **Polish Integration**: Lowercase `index__` prefix aligns with standardization
+3. **Leading Zero Normalization**: Automatic cleanup while preserving single '0'
+4. **Schema Conflict Prevention**: Entity-specific mapping columns (`customer_index`, `plant_index`)
+5. **Append Control**: `append_new_entities` parameter prevents inactive entity indexing
+6. **Idempotent Operations**: Running multiple times produces consistent results
+7. **Explicit Data Types**: All indices consistently cast to `long`
 
-The error you encountered should now be completely resolved! 🎉
+## 📊 Benefits
+
+- ✅ **No storage dependencies**: Works identically in all environments
+- ✅ **No metastore issues**: No catalog or schema management required
+- ✅ **Polish compatibility**: Seamless integration with standardization workflow
+- ✅ **Performance**: In-memory operations, no Delta table overhead
+- ✅ **Reliability**: No race conditions or MERGE operation complexity
+
+## 📚 Documentation
+
+See the updated guides:
+- **[Tooling Guide](resources/guide__tooling.md)** - Complete TableIndexer documentation
+- **[CLAUDE.md](CLAUDE.md)** - Usage patterns and examples
+
+The legacy storage-based TableIndexer and its associated issues are now completely obsolete! 🎉

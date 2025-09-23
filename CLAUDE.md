@@ -51,6 +51,17 @@ The Demand Planning Agent is built on a Unix-like tool composition philosophy wh
   - Column reordering (key columns, code columns, others - alphabetical)
   - Medallion architecture compliance
 
+#### Entity Indexing
+- **`tool__table_indexer.py`** - Stateless entity indexing for dimensional modeling
+  - Assigns stable, consecutive indices to unique, normalized entities
+  - Supports customer, plant, material, and custom entity types
+  - Leading zero normalization and case standardization
+  - Polish-compatible naming (lowercase `index__` prefix)
+  - Append control for mapping expansion (`append_new_entities` parameter)
+  - Entity-specific mapping columns (`customer_index`, `plant_index`, etc.)
+  - Idempotent operations prevent duplicate index columns
+  - Schema conflict prevention for batch mapping saves
+
 #### LLM Integration
 - **`tools/tool__local_llm.py`** - Local LLM client for agentic reasoning
   - Ollama integration with automatic availability detection
@@ -183,6 +194,38 @@ chain__gold_demand.trace(shape=True)
 # Inspect specific DataFrame
 chain__gold_demand.look(0)  # First DataFrame
 chain__gold_demand.look(-1) # Latest DataFrame
+```
+
+### Entity Indexing Patterns
+```python
+from tool__table_indexer import TableIndexer
+from tool__table_polisher import polish
+
+# Polish-compatible workflow
+polished_df = polish(raw_df)  # Standardize first
+indexer = TableIndexer(polished_df)
+
+# Basic entity indexing
+customer_result = indexer.customer("keyp__customer")
+plant_result = indexer.plant("plant_location")
+material_result = indexer.material("material_code")
+
+# Controlled mapping expansion
+result = indexer.customer("customer_code",
+                         existing_mapping_df=active_customers,
+                         append_new_entities=False)  # Only index existing
+
+# Access results
+mapping_df = result["mapping"]           # [customer, customer_index]
+indexed_df = result["focal_indexed"]     # Original DF + index__customer_code
+
+# Safe batch mapping saves (no schema conflicts)
+for kind, mapping in {
+    "customer": customer_result["mapping"],
+    "plant": plant_result["mapping"],
+    "material": material_result["mapping"]
+}.items():
+    mapping.write.format("delta").mode("overwrite").saveAsTable(f"catalog.schema.map__{kind}s")
 ```
 
 ## Naming Conventions
