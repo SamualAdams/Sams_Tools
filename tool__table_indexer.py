@@ -101,13 +101,18 @@ class TableIndexer:
         return F.concat_ws("|", *normalized_cols)
 
     def _get_cached_base_df(self):
-        """Get cached version of base DataFrame for performance."""
+        """Get cached version of base DataFrame for performance (serverless-compatible)."""
         if self._cached_base_df is None:
-            self._cached_base_df = self.indexed_df.cache()
+            try:
+                # Try memory-only caching for serverless compatibility
+                self._cached_base_df = self.indexed_df.persist()
+            except:
+                # Fallback: no caching if persist fails on serverless
+                self._cached_base_df = self.indexed_df
         return self._cached_base_df
 
     def _get_cached_entities(self, cache_key, normalized_expr, normalized_entity):
-        """Get cached entity extraction to avoid redundant processing."""
+        """Get cached entity extraction to avoid redundant processing (serverless-compatible)."""
         if cache_key not in self._entity_cache:
             cached_df = self._get_cached_base_df()
             entities = (
@@ -115,8 +120,12 @@ class TableIndexer:
                 .select(normalized_expr.alias(normalized_entity))
                 .distinct()
                 .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
-                .cache()  # Cache the distinct entities
             )
+            # Try to cache, but continue without caching if it fails on serverless
+            try:
+                entities = entities.persist()
+            except:
+                pass  # Continue without caching on serverless
             self._entity_cache[cache_key] = entities
         return self._entity_cache[cache_key]
 
