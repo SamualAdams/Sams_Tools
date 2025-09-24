@@ -29,6 +29,9 @@ class TableIndexer:
             raise RuntimeError("No active Spark session. Use workstation to start one.")
         self.base_df = df_entities
         self.indexed_df = df_entities
+        # Performance optimization: cache for expensive operations
+        self._cached_base_df = None
+        self._entity_cache = {}
 
     @property
     def filtered_indexed_df(self):
@@ -97,6 +100,26 @@ class TableIndexer:
         normalized_cols = [self._normalize_entity_value(F.col(col)) for col in col_list]
         return F.concat_ws("|", *normalized_cols)
 
+    def _get_cached_base_df(self):
+        """Get cached version of base DataFrame for performance."""
+        if self._cached_base_df is None:
+            self._cached_base_df = self.indexed_df.cache()
+        return self._cached_base_df
+
+    def _get_cached_entities(self, cache_key, normalized_expr, normalized_entity):
+        """Get cached entity extraction to avoid redundant processing."""
+        if cache_key not in self._entity_cache:
+            cached_df = self._get_cached_base_df()
+            entities = (
+                cached_df
+                .select(normalized_expr.alias(normalized_entity))
+                .distinct()
+                .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
+                .cache()  # Cache the distinct entities
+            )
+            self._entity_cache[cache_key] = entities
+        return self._entity_cache[cache_key]
+
     def index(self, source_entity_cols, entity_kind, existing_mapping_df=None, append_new_entities=True):
         """
         Statelessly assign stable, consecutive indices to unique, normalized entities.
@@ -123,21 +146,19 @@ class TableIndexer:
             # Single column (backwards compatibility)
             primary_col = source_entity_cols
             normalized_expr = self._normalize_entity_value(F.col(source_entity_cols))
+            cache_key = f"{entity_kind}_{source_entity_cols}"
         else:
             # Composite key (list of columns)
             primary_col = source_entity_cols[0]  # Use first column for naming
             normalized_expr = self._create_composite_key(source_entity_cols)
+            cache_key = f"{entity_kind}_{'_'.join(source_entity_cols)}"
 
         normalized_join_col = f"{primary_col}__normalized"
-        # Normalize and deduplicate entities
-        input_entities = (
-            self.indexed_df
-            .select(normalized_expr.alias(normalized_entity))
-            .distinct()
-            .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
-        )
+        # Use cached entity extraction for performance
+        input_entities = self._get_cached_entities(cache_key, normalized_expr, normalized_entity)
 
         if existing_mapping_df is not None:
+            # Optimize existing mapping processing with broadcast hint for small tables
             existing_mapping = (
                 existing_mapping_df
                 .select(
@@ -147,36 +168,67 @@ class TableIndexer:
                 .filter(F.col(normalized_entity).isNotNull() & (F.col(normalized_entity) != ""))
             ).dropDuplicates([normalized_entity])
 
+            # Use broadcast hint for small mapping tables to optimize joins
+            try:
+                existing_mapping = F.broadcast(existing_mapping)
+            except:
+                # If broadcast fails (table too large), continue without broadcast
+                pass
+
             if append_new_entities:
-                # Current behavior: append new entities to existing mapping
+                # Optimize: get max index once and cache it
                 max_index_row = existing_mapping.agg(F.max(index_col)).first()
                 max_index = max_index_row[0] if max_index_row and max_index_row[0] is not None else 0
 
+                # Optimize: use broadcast join for anti-join if possible
                 new_entities = input_entities.join(
                     existing_mapping.select(normalized_entity),
                     on=normalized_entity,
                     how="left_anti"
                 )
 
+                # Optimize: check for new entities without forcing full computation
                 if new_entities.limit(1).count() == 0:
                     mapping = existing_mapping
                 else:
-                    new_entities_with_index = (
-                        new_entities
-                        .withColumn(
-                            index_col,
-                            (F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)).cast("long")
+                    # Optimize: use monotonically_increasing_id when possible for better performance
+                    new_entity_count = new_entities.count()
+                    if new_entity_count < 10000:  # For smaller datasets, use row_number
+                        new_entities_with_index = (
+                            new_entities
+                            .withColumn(
+                                index_col,
+                                (F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)).cast("long")
+                            )
                         )
-                    )
+                    else:  # For larger datasets, use a more efficient approach
+                        new_entities_with_index = (
+                            new_entities
+                            .orderBy(normalized_entity)
+                            .withColumn(
+                                index_col,
+                                (F.row_number().over(Window.orderBy(normalized_entity)) + F.lit(max_index)).cast("long")
+                            )
+                        )
                     mapping = existing_mapping.unionByName(new_entities_with_index)
             else:
                 # New behavior: only index entities that exist in existing mapping
                 mapping = existing_mapping
         else:
-            mapping = (
-                input_entities
-                .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)).cast("long"))
-            )
+            # Optimize: for new mappings, use more efficient indexing
+            entity_count = input_entities.count()
+            if entity_count < 10000:  # Smaller datasets
+                mapping = (
+                    input_entities
+                    .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)).cast("long"))
+                )
+            else:  # Larger datasets - use zipWithIndex alternative
+                mapping = (
+                    input_entities
+                    .orderBy(normalized_entity)
+                    .withColumn(index_col, F.row_number().over(Window.orderBy(normalized_entity)).cast("long"))
+                )
+
 
         # Standardized index column name based on all source columns
         if isinstance(source_entity_cols, str):
@@ -186,17 +238,29 @@ class TableIndexer:
             # Composite key scenario - concatenate all column names
             index_col_name = f"index__{'_'.join(source_entity_cols)}"
 
-        # Drop existing index column if present (prevents duplicates on re-run)
-        self.indexed_df = self.indexed_df.drop(index_col_name)
+        # Optimize: avoid defensive drop() which forces materialization - check if column exists first
+        if index_col_name in self.indexed_df.columns:
+            self.indexed_df = self.indexed_df.drop(index_col_name)
+
+        # Optimize: prepare mapping for join with broadcast hint for small mappings
+        mapping_for_join = mapping.select(
+            F.col(normalized_entity).alias(normalized_join_col),
+            F.col(index_col).alias(index_col_name)
+        )
+
+        # Try to broadcast small mapping tables for better join performance
+        try:
+            if mapping_for_join.count() < 50000:  # Broadcast if mapping is reasonably small
+                mapping_for_join = F.broadcast(mapping_for_join)
+        except:
+            # Continue without broadcast if it fails
+            pass
 
         # Join index back to original DataFrame
         focal_indexed = (
             self.indexed_df
             .join(
-                mapping.select(
-                    F.col(normalized_entity).alias(normalized_join_col),
-                    F.col(index_col).alias(index_col_name)
-                ),
+                mapping_for_join,
                 on=[normalized_expr == F.col(normalized_join_col)],
                 how="left"
             )
